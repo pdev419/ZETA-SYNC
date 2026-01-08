@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""
+Mock ZETA-SYNC engine
+--------------------
+This simulates a real ZETA-SYNC process for M1/M2 development.
+
+It prints structured metrics to stdout every second.
+The cluster controller reads these lines and aggregates them.
+"""
+
+import json
+import random
+import signal
+import sys
+import time
+
+RUNNING = True
+
+
+def handle_signal(sig, frame):
+    global RUNNING
+    RUNNING = False
+
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
+
+
+def main():
+    print('zeta sync starting')
+    node_id = f"local-{random.randint(1000, 9999)}"
+    seq = 0
+
+    # warm-up
+    time.sleep(1.0)
+
+    while RUNNING:
+        seq += 1
+        print(seq)
+
+        # simulate values near a stable reference
+        z = 1.0 + random.uniform(-0.0005, 0.0005)
+        drift = random.uniform(-0.05, 0.05)
+        stability = max(0.0, 1.0 - abs(drift) * 0.1)
+        ppm_offset = random.uniform(-1.0, 1.0)
+
+        payload = {
+            "type": "metrics",
+            "sequence": seq,
+            "z": round(z, 8),
+             "drift": round(drift, 6),
+            "stability": round(stability, 6),
+            "ppm_offset": round(ppm_offset, 6),
+            "rate_hz": 10_000_000,
+            "peer_rate_hz": 10_000_000,
+        }
+
+        # IMPORTANT: one JSON object per line
+        print(json.dumps(payload), flush=True)
+
+        time.sleep(1.0)
+
+    # graceful shutdown message
+    print(json.dumps({"type": "shutdown"}), flush=True)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
