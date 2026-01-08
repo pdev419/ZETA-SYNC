@@ -48,7 +48,6 @@ data/**
 .pm2/
 pm2.log
 pm2-debug.log
-ecosystem.config.js
 
 # ============================
 # OS / Editor
