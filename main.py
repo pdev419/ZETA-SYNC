@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from importlib import reload
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -486,4 +487,5 @@ if __name__ == "__main__":
         host=app.state.ctx.settings.http_host,
         port=app.state.ctx.settings.http_port,
         log_level="info",
+        reload=True
     )
