@@ -27,7 +27,6 @@ signal.signal(signal.SIGINT, handle_signal)
 
 
 def main():
-    print('zeta sync starting')
     node_id = f"local-{random.randint(1000, 9999)}"
     seq = 0
 
@@ -36,7 +35,6 @@ def main():
 
     while RUNNING:
         seq += 1
-        print(seq)
 
         # simulate values near a stable reference
         z = 1.0 + random.uniform(-0.0005, 0.0005)
@@ -48,7 +46,7 @@ def main():
             "type": "metrics",
             "sequence": seq,
             "z": round(z, 8),
-             "drift": round(drift, 6),
+            "drift": round(drift, 6),
             "stability": round(stability, 6),
             "ppm_offset": round(ppm_offset, 6),
             "rate_hz": 10_000_000,
