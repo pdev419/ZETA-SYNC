@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -62,15 +63,26 @@ def remote_ip_from_peer_id(peer_id: str) -> Optional[str]:
     return peer_id.rsplit(":", 1)[0].strip() or None
 
 
+def detect_lan_ip() -> Optional[str]:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return None
+
+
 @dataclass(frozen=True)
 class Settings:
     http_host: str
     http_port: int
     peer_host: str
     peer_port: int
-
     peer_advertise_host: str
-
     seeds: List[str]
     gossip_interval_sec: float
     zeta_sync_cmd: str
@@ -98,6 +110,7 @@ class NodeRuntime:
     node_id: str
     settings: Settings
     discovery: Discovery
+    self_advertise_addr: str
 
     metrics_by_node: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
@@ -110,8 +123,7 @@ class NodeRuntime:
     zeta_proc: Optional[ZetaSyncProcess] = None
 
     def advertise_addr(self) -> str:
-        host = self.settings.peer_advertise_host or self.settings.peer_host
-        return f"{host}:{self.settings.peer_port}"
+        return self.self_advertise_addr
 
     def next_seq(self) -> int:
         self.local_seq += 1
@@ -165,6 +177,8 @@ class NodeRuntime:
     def learn_peer_identity(self, peer_addr: str, node_id: str) -> None:
         if not peer_addr or not node_id:
             return
+        if node_id == self.node_id:
+            return
         self.peer_addr_to_node_id[peer_addr] = node_id
         self.node_id_to_peer_addr[node_id] = peer_addr
 
@@ -183,17 +197,18 @@ class NodeRuntime:
             "seeds": self.settings.seeds,
         }
 
-    def nodes_view(self) -> Dict[str, Any]:
+    def nodes_view(self, include_unknown: bool = False) -> Dict[str, Any]:
         nodes: List[Dict[str, Any]] = []
         nodes.append({
             "node_id": self.node_id,
-            "peer_addr": self.node_id_to_peer_addr.get(self.node_id) or self.advertise_addr(),
+            "peer_addr": self.advertise_addr(),
             "metrics": self.metrics_by_node.get(self.node_id, {}),
             "excluded": self.node_id in self.excluded_nodes,
         })
 
         seen: Set[str] = {self.node_id}
 
+        # Known peers from discovery (addresses)
         for peer_addr in sorted(self.discovery.known_peers):
             nid = self.peer_addr_to_node_id.get(peer_addr)
             if nid:
@@ -207,12 +222,13 @@ class NodeRuntime:
                     "excluded": nid in self.excluded_nodes,
                 })
             else:
-                nodes.append({
-                    "node_id": None,
-                    "peer_addr": peer_addr,
-                    "metrics": {},
-                    "excluded": False,
-                })
+                if include_unknown:
+                    nodes.append({
+                        "node_id": None,
+                        "peer_addr": peer_addr,
+                        "metrics": {},
+                        "excluded": False,
+                    })
 
         return {"nodes": nodes}
 
@@ -322,11 +338,7 @@ async def metrics_loop(ctx: NodeRuntime) -> None:
                 if has_min_disk_free(LOG_DIR):
                     append_jsonl(
                         METRICS_LOG,
-                        {
-                            "node_id": ctx.node_id,
-                            "sequence_id": ctx.next_seq(),
-                            "metrics": parsed,
-                        },
+                        {"node_id": ctx.node_id, "sequence_id": ctx.next_seq(), "metrics": parsed},
                     )
 
         await asyncio.sleep(0.2)
@@ -361,11 +373,17 @@ def create_app() -> FastAPI:
 
     settings = load_settings()
     node_id = load_or_create_node_id()
+    adv_host = settings.peer_advertise_host.strip()
+    if not adv_host:
+        adv_host = detect_lan_ip() or "127.0.0.1"
+
+    self_advertise_addr = f"{adv_host}:{settings.peer_port}"
 
     ctx = NodeRuntime(
         node_id=node_id,
         settings=settings,
         discovery=Discovery(settings.seeds),
+        self_advertise_addr=self_advertise_addr,
         metrics_by_node={node_id: {}},
     )
     ctx.log_event("NODE_BOOTED", advertise=ctx.advertise_addr(), seeds=settings.seeds)
@@ -381,7 +399,11 @@ def create_app() -> FastAPI:
             ssl=None,
         )
         await peer_server.start()
-        ctx.log_event("PEER_SERVER_STARTED", bind=f"{settings.peer_host}:{settings.peer_port}", advertise=ctx.advertise_addr())
+        ctx.log_event(
+            "PEER_SERVER_STARTED",
+            bind=f"{settings.peer_host}:{settings.peer_port}",
+            advertise=ctx.advertise_addr(),
+        )
 
         t1 = asyncio.create_task(discovery_loop(ctx))
         t2 = asyncio.create_task(metrics_loop(ctx))
@@ -435,8 +457,8 @@ def create_app() -> FastAPI:
         return app.state.ctx.cluster_status()
 
     @app.get("/api/v1/nodes")
-    async def api_nodes():
-        return app.state.ctx.nodes_view()
+    async def api_nodes(include_unknown: bool = Query(False)):
+        return app.state.ctx.nodes_view(include_unknown=include_unknown)
 
     @app.get("/api/v1/cluster/events")
     async def api_events():
@@ -449,7 +471,6 @@ app = create_app()
 
 if __name__ == "__main__":
     env = os.getenv("APP_ENV", "dev").lower()
-
     uvicorn.run(
         "main:app",
         host=app.state.ctx.settings.http_host,
