@@ -448,9 +448,13 @@ def create_app() -> FastAPI:
 app = create_app()
 
 if __name__ == "__main__":
+    env = os.getenv("APP_ENV", "dev").lower()
+
     uvicorn.run(
         "main:app",
         host=app.state.ctx.settings.http_host,
         port=app.state.ctx.settings.http_port,
-        log_level="info",
+        reload=(env == "dev"),
+        workers=1,
+        log_level=("debug" if env == "dev" else "info"),
     )
