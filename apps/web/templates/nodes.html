@@ -35,6 +35,7 @@
         const res = await fetch("/api/v1/nodes?include_unknown=" + includeUnknown).then(r => r.json());
         document.getElementById("nodes").textContent = JSON.stringify(res, null, 2);
       }
+      setInterval(loadNodes, 1000);
       loadNodes();
     </script>
   </body>
