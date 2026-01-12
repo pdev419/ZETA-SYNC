@@ -86,6 +86,13 @@ def detect_lan_ip() -> Optional[str]:
     return None
 
 
+def atomic_write(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
 def _cn_from_peer_cert(peer_cert: dict | None) -> Optional[str]:
     """
     peer_cert is ssl.getpeercert() dict:
@@ -552,11 +559,37 @@ def create_app() -> FastAPI:
         await app.state.ctx.stop_sync()
         return {"ok": True}
 
-    # ---------------- Mgmt security endpoints ----------------
     @app.post("/mgmt/security/ca/init", dependencies=[Depends(require_admin)])
     async def mgmt_ca_init():
-        ensure_cluster_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path), validity_days=int(os.getenv("TLS_CA_VALIDITY_DAYS", "3650")))
-        return {"ok": True, "ca_cert_path": str(app.state.ca_cert_path)}
+        ca_days = int(os.getenv("TLS_CA_VALIDITY_DAYS", "3650"))
+        ensure_cluster_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path), validity_days=ca_days)
+
+        created_self_identity = False
+
+        if not (app.state.node_cert_path.exists() and app.state.node_key_path.exists()):
+            ca_key, ca_cert = load_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path))
+            node_key_pem, node_cert_pem = issue_node_cert(
+                ca_key, ca_cert,
+                node_id=app.state.ctx.node_id,
+                validity_days=app.state.node_validity_days
+            )
+
+            atomic_write(app.state.node_key_path, node_key_pem.decode("utf-8"))
+            atomic_write(app.state.node_cert_path, node_cert_pem.decode("utf-8"))
+            atomic_write(app.state.ca_cert_path, app.state.ca_cert_path.read_text(encoding="utf-8"))
+
+            created_self_identity = True
+            app.state.ctx.log_event("TLS_SELF_IDENTITY_ISSUED", severity="WARNING", node_id=app.state.ctx.node_id)
+
+        return {
+            "ok": True,
+            "ca_cert_path": str(app.state.ca_cert_path),
+            "node_cert_path": str(app.state.node_cert_path),
+            "node_key_path": str(app.state.node_key_path),
+            "created_self_identity": created_self_identity,
+            "next_step": "Click 'Restart service' so TLS contexts load."
+        }
+
 
     @app.get("/mgmt/security/ca/cert", dependencies=[Depends(require_admin)])
     async def mgmt_ca_cert():
@@ -675,12 +708,6 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="invalid node_key_pem")
 
         TLS_DIR.mkdir(parents=True, exist_ok=True)
-
-        def atomic_write(path: Path, content: str):
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(content, encoding="utf-8")
-            tmp.replace(path)
-
         atomic_write(app.state.ca_cert_path, ca_pem)
         atomic_write(app.state.node_cert_path, node_cert_pem)
         atomic_write(app.state.node_key_path, node_key_pem)
