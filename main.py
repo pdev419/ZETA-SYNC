@@ -1,10 +1,10 @@
+# main.py
 from __future__ import annotations
 
 import asyncio
 import os
 import secrets
 import socket
-import ssl
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
@@ -25,14 +25,7 @@ from node.constants import ENV_FILE, EVENTS_LOG, LOG_DIR, METRICS_LOG, PROJECT_R
 from node.peer.client import send_message
 from node.peer.server import PeerServer
 from node.peer.tls import TLSPaths, build_client_ssl_context, build_server_ssl_context
-from node.security.ca import (
-    CAPaths,
-    ensure_cluster_ca,
-    issue_node_cert,
-    load_ca,
-    sha256_fingerprint_from_cert_pem,
-    sign_csr,
-)
+from node.security.ca import CAPaths, ensure_cluster_ca, issue_node_cert, load_ca, sign_csr
 from node.security.store import SecurityStore
 from node.storage.jsonl import append_jsonl, has_min_disk_free, tail_jsonl
 from node.storage.node_id import load_or_create_node_id
@@ -40,11 +33,10 @@ from node.storage.paths import ensure_dirs
 from node.sync.metrics_reader import parse_metrics_line
 from node.sync.process_manager import ZetaSyncProcess
 
-
 TEMPLATES_DIR = PROJECT_ROOT / "apps" / "web" / "templates"
 STATIC_DIR = PROJECT_ROOT / "apps" / "web" / "static"
 
-# --- Internal persistence paths ---
+# --- Internal persistence paths (NO external paths) ---
 SECURITY_JSON = PROJECT_ROOT / "data" / "state" / "security" / "security.json"
 TLS_DIR = PROJECT_ROOT / "data" / "state" / "tls"
 CA_KEY = TLS_DIR / "ca.key"
@@ -94,7 +86,10 @@ def detect_lan_ip() -> Optional[str]:
 
 
 def _cn_from_peer_cert(peer_cert: dict | None) -> Optional[str]:
-    # ssl.getpeercert() dict: {'subject': ((('commonName','node-xxx'),), ...), ...}
+    """
+    peer_cert is ssl.getpeercert() dict:
+      {'subject': ((('commonName','node-xxx'),), ...), ...}
+    """
     if not peer_cert:
         return None
     try:
@@ -192,10 +187,14 @@ class NodeRuntime:
             await self.zeta_proc.start()
         except FileNotFoundError as e:
             self.log_event("SYNC_START_FAILED", severity="ERROR", reason="FILE_NOT_FOUND", detail=str(e))
-            raise RuntimeError(f"ZETA_SYNC_CMD not found. Check .env ZETA_SYNC_CMD='{self.settings.zeta_sync_cmd}'.") from e
+            raise RuntimeError(
+                f"ZETA_SYNC_CMD not found. Check .env ZETA_SYNC_CMD='{self.settings.zeta_sync_cmd}'."
+            ) from e
         except PermissionError as e:
             self.log_event("SYNC_START_FAILED", severity="ERROR", reason="PERMISSION_DENIED", detail=str(e))
-            raise RuntimeError(f"ZETA_SYNC_CMD not executable. chmod +x '{self.settings.zeta_sync_cmd}'.") from e
+            raise RuntimeError(
+                f"ZETA_SYNC_CMD not executable. chmod +x '{self.settings.zeta_sync_cmd}'."
+            ) from e
 
         self.log_event("SYNC_STARTED", cmd=[self.settings.zeta_sync_cmd] + self.settings.zeta_sync_args)
 
@@ -218,13 +217,18 @@ class NodeRuntime:
         self.metrics_by_node[node_id] = metrics
 
     def nodes_view(self, include_unknown: bool = False) -> Dict[str, Any]:
+        """
+        Default: do NOT show unknown peers (node_id null).
+        """
         nodes: List[Dict[str, Any]] = []
-        nodes.append({
-            "node_id": self.node_id,
-            "peer_addr": self.advertise_addr(),
-            "metrics": self.metrics_by_node.get(self.node_id, {}),
-            "excluded": self.node_id in self.excluded_nodes,
-        })
+        nodes.append(
+            {
+                "node_id": self.node_id,
+                "peer_addr": self.advertise_addr(),
+                "metrics": self.metrics_by_node.get(self.node_id, {}),
+                "excluded": self.node_id in self.excluded_nodes,
+            }
+        )
 
         seen: Set[str] = {self.node_id}
         for peer_addr in sorted(self.discovery.known_peers):
@@ -233,15 +237,18 @@ class NodeRuntime:
                 if nid in seen:
                     continue
                 seen.add(nid)
-                nodes.append({
-                    "node_id": nid,
-                    "peer_addr": peer_addr,
-                    "metrics": self.metrics_by_node.get(nid, {}),
-                    "excluded": nid in self.excluded_nodes,
-                })
+                nodes.append(
+                    {
+                        "node_id": nid,
+                        "peer_addr": peer_addr,
+                        "metrics": self.metrics_by_node.get(nid, {}),
+                        "excluded": nid in self.excluded_nodes,
+                    }
+                )
             else:
                 if include_unknown:
                     nodes.append({"node_id": None, "peer_addr": peer_addr, "metrics": {}, "excluded": False})
+
         return {"nodes": nodes}
 
     def cluster_status(self) -> Dict[str, Any]:
@@ -252,8 +259,9 @@ class NodeRuntime:
         }
 
 
-# --- Simple admin auth for mgmt ---
+# --- Simple admin auth for mgmt (Basic Auth acceptable for PoC) ---
 security_basic = HTTPBasic()
+
 
 def require_admin(creds: HTTPBasicCredentials = Depends(security_basic)):
     user = os.getenv("ADMIN_USER", "admin")
@@ -287,21 +295,22 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
 
         if require_allow and (not store.is_allowed(peer_node_id)):
             now = time.time()
-            fp_key = f"cn:{peer_node_id}"
+            pending_key = f"cn:{peer_node_id}"
             rec = store.load()
-            last = float(rec.pending.get(fp_key, {}).get("last_seen", 0))
+            last = float(rec.pending.get(pending_key, {}).get("last_seen", 0))
             if now - last >= float(app.state.tls_join_throttle):
                 store.upsert_pending(
-                    fp_key,
+                    pending_key,
                     {
                         "node_id": peer_node_id,
                         "peer": meta.get("peer_id"),
                         "peer_cert_subject": peer_cert.get("subject") if isinstance(peer_cert, dict) else None,
-                        "first_seen": rec.pending.get(fp_key, {}).get("first_seen", now),
+                        "first_seen": rec.pending.get(pending_key, {}).get("first_seen", now),
                         "last_seen": now,
                     },
                 )
                 ctx.log_event("NODE_JOIN_REQUESTED", reason_code="not_allowlisted", node_id=peer_node_id)
+
             return {"type": "ERROR", "reason": "pending_approval"}
 
     # Normal peer messages
@@ -314,7 +323,6 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
             ctx.discovery.merge([peer_listen])
             if tls_enabled and peer_node_id:
                 ctx.learn_peer_identity(peer_listen, peer_node_id)
-
         return {"type": "HELLO_ACK", "from": ctx.node_id, "peers": sorted(ctx.discovery.known_peers)}
 
     if t == "PEER_LIST_REQ":
@@ -341,6 +349,7 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
     ctx.log_event("DISCOVERY_STARTED", advertise=advertise, seeds=ctx.settings.seeds)
 
     while True:
+        # Seed bootstrap
         for seed in list(ctx.settings.seeds):
             try:
                 host, port = parse_hostport(seed)
@@ -354,6 +363,7 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
             except Exception:
                 continue
 
+        # Gossip
         targets = ctx.discovery.pick_targets(k=2)
         payload = {"type": "GOSSIP", "peers": sorted(ctx.discovery.known_peers)}
         for tgt in targets:
@@ -388,6 +398,7 @@ async def metrics_loop(ctx: NodeRuntime) -> None:
                 ctx.upsert_peer_metrics(ctx.node_id, parsed)
                 if has_min_disk_free(LOG_DIR):
                     append_jsonl(METRICS_LOG, {"node_id": ctx.node_id, "sequence_id": ctx.next_seq(), "metrics": parsed})
+
         await asyncio.sleep(0.2)
 
 
@@ -422,6 +433,7 @@ def create_app() -> FastAPI:
     settings = load_settings()
     node_id = load_or_create_node_id()
 
+    # Always use stable advertise host; never 0.0.0.0 and never random 127.0.0.1 unless unavoidable
     adv_host = settings.peer_advertise_host.strip() or detect_lan_ip() or "127.0.0.1"
     self_advertise_addr = f"{adv_host}:{settings.peer_port}"
 
@@ -439,7 +451,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="ZETA-SYNC Cluster (M3)", lifespan=None)
     app.state.ctx = ctx
 
-    # security store
+    # Security store
     store = SecurityStore(SECURITY_JSON)
     app.state.security_store = store
 
@@ -461,10 +473,10 @@ def create_app() -> FastAPI:
     if app.state.tls_enabled:
         ensure_cluster_ca(CAPaths(CA_KEY, CA_CERT), validity_days=ca_days)
 
-    # Build SSL contexts if node has certs
+    # Build SSL contexts if node has certs (after provisioning + restart)
     app.state.server_ssl_ctx = None
     app.state.client_ssl_ctx = None
-    if app.state.tls_enabled and NODE_CERT.exists() and NODE_KEY.exists():
+    if app.state.tls_enabled and NODE_CERT.exists() and NODE_KEY.exists() and CA_CERT.exists():
         app.state.server_ssl_ctx = build_server_ssl_context(TLSPaths(CA_CERT, NODE_CERT, NODE_KEY))
         app.state.client_ssl_ctx = build_client_ssl_context(TLSPaths(CA_CERT, NODE_CERT, NODE_KEY))
 
@@ -479,7 +491,12 @@ def create_app() -> FastAPI:
             ssl=app_.state.server_ssl_ctx if app_.state.tls_enabled else None,
         )
         await peer_server.start()
-        ctx.log_event("PEER_SERVER_STARTED", bind=f"{settings.peer_host}:{settings.peer_port}", advertise=ctx.advertise_addr())
+        ctx.log_event(
+            "PEER_SERVER_STARTED",
+            bind=f"{settings.peer_host}:{settings.peer_port}",
+            advertise=ctx.advertise_addr(),
+            tls=bool(app_.state.tls_enabled),
+        )
 
         t1 = asyncio.create_task(discovery_loop(ctx, app_))
         t2 = asyncio.create_task(metrics_loop(ctx))
@@ -543,16 +560,11 @@ def create_app() -> FastAPI:
     async def mgmt_issue_node_cert(node_id: str):
         ca_key, ca_cert = load_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path))
         node_key_pem, node_cert_pem = issue_node_cert(ca_key, ca_cert, node_id=node_id, validity_days=app.state.node_validity_days)
-        fp = sha256_fingerprint_from_cert_pem(node_cert_pem)
-
         return {
             "node_id": node_id,
-            "fingerprint": fp,
             "ca_cert_pem": app.state.ca_cert_path.read_text(encoding="utf-8"),
             "node_cert_pem": node_cert_pem.decode("utf-8"),
             "node_key_pem": node_key_pem.decode("utf-8"),
-            "install_to": "data/state/tls/",
-            "files": {"ca.crt": "ca_cert_pem", "node.crt": "node_cert_pem", "node.key": "node_key_pem"},
         }
 
     @app.post("/mgmt/security/nodes/sign-csr", dependencies=[Depends(require_admin)])
@@ -572,8 +584,6 @@ def create_app() -> FastAPI:
         info = rec.pending.get(pending_key)
         if not info:
             raise HTTPException(status_code=404, detail="pending entry not found")
-
-        # minimal subject for storage
         subj = {"commonName": info.get("node_id")}
         app.state.security_store.approve_node(node_id=node_id, fingerprint=pending_key, cert_subject=subj)
         app.state.ctx.log_event("NODE_APPROVED", node_id=node_id)
@@ -594,7 +604,97 @@ def create_app() -> FastAPI:
     @app.get("/mgmt/security/state", dependencies=[Depends(require_admin)])
     async def mgmt_security_state():
         rec = app.state.security_store.load()
-        return {"allowlist": rec.allowlist, "blocklist": rec.blocklist, "pending": rec.pending}
+        return {"allowlist": rec.allowlist, "blocklist": rec.blocklist, "pending": rec.pending, "bootstrap": rec.bootstrap}
+
+    # ---------------- UI-only mTLS provisioning (NO PEM copy/paste) ----------------
+    @app.post("/mgmt/security/bootstrap/token/create", dependencies=[Depends(require_admin)])
+    async def mgmt_bootstrap_token_create():
+        token = app.state.security_store.create_bootstrap_token()
+        app.state.ctx.log_event("BOOTSTRAP_TOKEN_CREATED", severity="WARNING")
+        return {"token": token}
+
+    @app.post("/mgmt/security/bootstrap/issue")
+    async def mgmt_bootstrap_issue(payload: Dict[str, Any]):
+        """
+        Called by another node:
+          POST { node_id, token }
+        Returns:
+          { ca_cert_pem, node_cert_pem, node_key_pem, meta }
+        """
+        node_id_req = str(payload.get("node_id") or "").strip()
+        token = str(payload.get("token") or "").strip()
+
+        if not node_id_req:
+            raise HTTPException(status_code=400, detail="node_id required")
+        if not token:
+            raise HTTPException(status_code=400, detail="token required")
+
+        if not app.state.security_store.verify_bootstrap_token(token):
+            app.state.ctx.log_event("BOOTSTRAP_ISSUE_DENIED", severity="ERROR", node_id=node_id_req, reason="bad_token")
+            raise HTTPException(status_code=403, detail="invalid bootstrap token")
+
+        ensure_cluster_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path), validity_days=int(os.getenv("TLS_CA_VALIDITY_DAYS", "3650")))
+
+        ca_key, ca_cert = load_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path))
+        node_key_pem, node_cert_pem = issue_node_cert(ca_key, ca_cert, node_id=node_id_req, validity_days=app.state.node_validity_days)
+
+        app.state.ctx.log_event("BOOTSTRAP_ISSUED", severity="WARNING", node_id=node_id_req)
+
+        return {
+            "ca_cert_pem": app.state.ca_cert_path.read_text(encoding="utf-8"),
+            "node_cert_pem": node_cert_pem.decode("utf-8"),
+            "node_key_pem": node_key_pem.decode("utf-8"),
+            "meta": {"issued_for": node_id_req, "validity_days": app.state.node_validity_days, "install_to": "data/state/tls/"},
+        }
+
+    @app.post("/mgmt/security/local/install-bundle", dependencies=[Depends(require_admin)])
+    async def mgmt_local_install_bundle(payload: Dict[str, Any]):
+        """
+        Writes local files:
+          data/state/tls/ca.crt
+          data/state/tls/node.crt
+          data/state/tls/node.key
+        """
+        ca_pem = str(payload.get("ca_cert_pem") or "")
+        node_cert_pem = str(payload.get("node_cert_pem") or "")
+        node_key_pem = str(payload.get("node_key_pem") or "")
+
+        if "BEGIN CERTIFICATE" not in ca_pem:
+            raise HTTPException(status_code=400, detail="invalid ca_cert_pem")
+        if "BEGIN CERTIFICATE" not in node_cert_pem:
+            raise HTTPException(status_code=400, detail="invalid node_cert_pem")
+        if "BEGIN" not in node_key_pem:
+            raise HTTPException(status_code=400, detail="invalid node_key_pem")
+
+        TLS_DIR.mkdir(parents=True, exist_ok=True)
+
+        def atomic_write(path: Path, content: str):
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(content, encoding="utf-8")
+            tmp.replace(path)
+
+        atomic_write(app.state.ca_cert_path, ca_pem)
+        atomic_write(app.state.node_cert_path, node_cert_pem)
+        atomic_write(app.state.node_key_path, node_key_pem)
+
+        app.state.ctx.log_event("TLS_BUNDLE_INSTALLED", severity="WARNING", path=str(TLS_DIR))
+        return {"ok": True, "written": [str(app.state.ca_cert_path), str(app.state.node_cert_path), str(app.state.node_key_path)]}
+
+    @app.post("/mgmt/system/restart", dependencies=[Depends(require_admin)])
+    async def mgmt_system_restart(background: BackgroundTasks):
+        """
+        PM2-friendly restart:
+        - Exit process
+        - PM2 restarts automatically
+        """
+        app.state.ctx.log_event("SYSTEM_RESTART_REQUESTED", severity="WARNING")
+
+        def do_exit():
+            time.sleep(0.4)
+            os._exit(0)
+
+        background.add_task(do_exit)
+        return {"ok": True, "message": "Exiting now; PM2 should restart it automatically."}
 
     # ---------------- Public API (read-only) ----------------
     @app.get("/api/v1/health")
