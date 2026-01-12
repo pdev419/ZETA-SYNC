@@ -1,21 +1,55 @@
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8"/>
-  <title>ZETA-SYNC Cluster</title>
-  <link rel="stylesheet" href="/static/styles.css">
-</head>
-<body>
-  <h1>ZETA-SYNC Cluster Dashboard</h1>
-  <pre id="status">Loading...</pre>
+  <head>
+    <meta charset="utf-8" />
+    <title>ZETA-SYNC</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>ZETA-SYNC Control</h1>
 
-  <h2>Controls</h2>
-  <button onclick="startSync()">Start Sync</button>
-  <button onclick="stopSync()">Stop Sync</button>
+      <div class="nav">
+        <a href="/">Home</a>
+        <a href="/nodes">Nodes</a>
+        <a href="/events">Events</a>
+        <a href="/security">Security (M3)</a>
+      </div>
 
-  <h2>Links</h2>
-  <a href="/nodes">Nodes</a> | <a href="/events">Events</a>
+      <div class="card">
+        <h2>Cluster controls</h2>
+        <p>These require Admin login (Basic Auth).</p>
+        <div class="row">
+          <button onclick="mgmtStart()">Start Sync</button>
+          <button onclick="mgmtStop()">Stop Sync</button>
+        </div>
+        <pre id="out"></pre>
+      </div>
 
-  <script src="/static/app.js"></script>
-</body>
+      <div class="card">
+        <h2>Status</h2>
+        <div class="row">
+          <button onclick="loadStatus()">Refresh</button>
+        </div>
+        <pre id="status"></pre>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+    <script>
+      async function mgmtStart() {
+        const res = await apiCall("POST", "/mgmt/cluster/start");
+        document.getElementById("out").textContent = JSON.stringify(res, null, 2);
+      }
+      async function mgmtStop() {
+        const res = await apiCall("POST", "/mgmt/cluster/stop");
+        document.getElementById("out").textContent = JSON.stringify(res, null, 2);
+      }
+      async function loadStatus() {
+        const res = await fetch("/api/v1/cluster/status").then(r => r.json());
+        document.getElementById("status").textContent = JSON.stringify(res, null, 2);
+      }
+      loadStatus();
+    </script>
+  </body>
 </html>

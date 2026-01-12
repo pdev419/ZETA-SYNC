@@ -1,21 +1,36 @@
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8"/>
-  <title>Events</title>
-</head>
-<body>
-  <h1>Events</h1>
-  <a href="/">Back</a>
-  <pre id="events">Loading...</pre>
+  <head>
+    <meta charset="utf-8" />
+    <title>ZETA-SYNC Events</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Events</h1>
 
-  <script>
-    async function refresh() {
-      const r = await fetch("/api/v1/cluster/events");
-      document.getElementById("events").innerText = JSON.stringify(await r.json(), null, 2);
-    }
-    setInterval(refresh, 1000);
-    refresh();
-  </script>
-</body>
+      <div class="nav">
+        <a href="/">Home</a>
+        <a href="/nodes">Nodes</a>
+        <a href="/events">Events</a>
+        <a href="/security">Security (M3)</a>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <button onclick="loadEvents()">Refresh</button>
+        </div>
+        <pre id="events"></pre>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+    <script>
+      async function loadEvents() {
+        const res = await fetch("/api/v1/cluster/events").then(r => r.json());
+        document.getElementById("events").textContent = JSON.stringify(res, null, 2);
+      }
+      loadEvents();
+    </script>
+  </body>
 </html>
