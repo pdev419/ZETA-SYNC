@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>ZETA-SYNC Security (M3)</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Security (M3)</h1>
+
+      <div class="nav">
+        <a href="/">Home</a>
+        <a href="/nodes">Nodes</a>
+        <a href="/events">Events</a>
+        <a href="/security">Security (M3)</a>
+      </div>
+
+      <div class="card">
+        <h2>Cluster CA</h2>
+        <p>Initialize CA once, then use it to issue node cert bundles.</p>
+        <div class="row">
+          <button onclick="caInit()">Init CA</button>
+          <button onclick="caShow()">Show CA cert</button>
+        </div>
+        <pre id="ca"></pre>
+      </div>
+
+      <div class="card">
+        <h2>Issue node cert bundle</h2>
+        <div class="row">
+          <input id="issueNodeId" placeholder="node-id (e.g. node-A)" style="min-width:260px;" />
+          <button onclick="issueCert()">Issue</button>
+        </div>
+        <p>Copy the returned PEMs into the target node:</p>
+        <code>data/state/tls/ca.crt</code>, <code>data/state/tls/node.crt</code>, <code>data/state/tls/node.key</code>
+        <pre id="issue"></pre>
+      </div>
+
+      <div class="card">
+        <h2>Pending nodes (Approve/Deny)</h2>
+        <div class="row">
+          <button onclick="loadPending()">Refresh pending</button>
+        </div>
+        <div id="pendingList"></div>
+      </div>
+
+      <div class="card">
+        <h2>Allowlist / Blocklist</h2>
+        <div class="row">
+          <button onclick="loadSecurityState()">Refresh</button>
+        </div>
+        <pre id="state"></pre>
+
+        <h3>Block node</h3>
+        <div class="row">
+          <input id="blockNodeId" placeholder="node-id to block" style="min-width:260px;" />
+          <input id="blockReason" placeholder="reason" style="min-width:260px;" />
+          <button onclick="blockNode()">Block</button>
+        </div>
+        <pre id="blockOut"></pre>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+    <script>
+      async function caInit() {
+        const res = await apiCall("POST", "/mgmt/security/ca/init");
+        document.getElementById("ca").textContent = JSON.stringify(res, null, 2);
+      }
+      async function caShow() {
+        const res = await apiCall("GET", "/mgmt/security/ca/cert");
+        document.getElementById("ca").textContent = res.ca_cert_pem || JSON.stringify(res, null, 2);
+      }
+      async function issueCert() {
+        const nodeId = document.getElementById("issueNodeId").value.trim();
+        if (!nodeId) return alert("Enter node_id");
+        const res = await apiCall("POST", "/mgmt/security/nodes/issue?node_id=" + encodeURIComponent(nodeId));
+        document.getElementById("issue").textContent = JSON.stringify(res, null, 2);
+      }
+
+      function pendingRow(key, item) {
+        const div = document.createElement("div");
+        div.className = "pending";
+        div.innerHTML = `
+          <div><b>Key:</b> ${escapeHtml(key)}</div>
+          <div><b>Node:</b> ${escapeHtml(item.node_id || "")}</div>
+          <div><b>Peer:</b> ${escapeHtml(item.peer || "")}</div>
+          <div class="row">
+            <input class="approveId" placeholder="approve as node_id" value="${escapeHtml(item.node_id || "")}" />
+            <button class="approveBtn">Approve</button>
+            <button class="denyBtn">Deny</button>
+          </div>
+          <pre>${escapeHtml(JSON.stringify(item, null, 2))}</pre>
+        `;
+        div.querySelector(".approveBtn").onclick = async () => {
+          const approveId = div.querySelector(".approveId").value.trim();
+          if (!approveId) return alert("Enter approve node_id");
+          const res = await apiCall("POST", "/mgmt/security/nodes/approve?node_id=" + encodeURIComponent(approveId) + "&pending_key=" + encodeURIComponent(key));
+          alert("Approved: " + JSON.stringify(res));
+          loadPending();
+          loadSecurityState();
+        };
+        div.querySelector(".denyBtn").onclick = async () => {
+          const res = await apiCall("POST", "/mgmt/security/nodes/deny?pending_key=" + encodeURIComponent(key));
+          alert("Denied: " + JSON.stringify(res));
+          loadPending();
+        };
+        return div;
+      }
+
+      async function loadPending() {
+        const res = await apiCall("GET", "/mgmt/security/nodes/pending");
+        const pending = res.pending || {};
+        const box = document.getElementById("pendingList");
+        box.innerHTML = "";
+        const keys = Object.keys(pending);
+        if (!keys.length) {
+          box.textContent = "No pending nodes.";
+          return;
+        }
+        keys.forEach(k => box.appendChild(pendingRow(k, pending[k])));
+      }
+
+      async function loadSecurityState() {
+        const res = await apiCall("GET", "/mgmt/security/state");
+        document.getElementById("state").textContent = JSON.stringify(res, null, 2);
+      }
+
+      async function blockNode() {
+        const nodeId = document.getElementById("blockNodeId").value.trim();
+        const reason = document.getElementById("blockReason").value.trim() || "revoked";
+        if (!nodeId) return alert("Enter node_id");
+        const res = await apiCall("POST", "/mgmt/security/nodes/block?node_id=" + encodeURIComponent(nodeId) + "&reason=" + encodeURIComponent(reason));
+        document.getElementById("blockOut").textContent = JSON.stringify(res, null, 2);
+        loadSecurityState();
+      }
+
+      loadPending();
+      loadSecurityState();
+    </script>
+  </body>
+</html>

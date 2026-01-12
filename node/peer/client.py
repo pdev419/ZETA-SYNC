@@ -1,14 +1,35 @@
 from __future__ import annotations
-import asyncio
-from typing import Dict, Any
-from .framing import read_frame, write_frame
 
-async def send_message(host: str, port: int, msg: Dict[str, Any], ssl=None, timeout: float = 3.0) -> Dict[str, Any]:
-    reader, writer = await asyncio.wait_for(asyncio.open_connection(host=host, port=port, ssl=ssl), timeout=timeout)
+import asyncio
+import json
+import ssl
+from typing import Any, Dict, Optional
+
+
+async def send_message(
+    host: str,
+    port: int,
+    msg: Dict[str, Any],
+    timeout: float = 3.0,
+    ssl_ctx: Optional[ssl.SSLContext] = None,
+) -> Dict[str, Any]:
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+
+    conn = asyncio.open_connection(host, port, ssl=ssl_ctx)
+    reader, writer = await asyncio.wait_for(conn, timeout=timeout)
+
     try:
-        await write_frame(writer, msg)
-        resp = await asyncio.wait_for(read_frame(reader), timeout=timeout)
-        return resp
+        writer.write((json.dumps(msg) + "\n").encode("utf-8"))
+        await writer.drain()
+
+        data = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        if not data:
+            return {"type": "ERROR", "reason": "no_response"}
+        return json.loads(data.decode("utf-8"))
     finally:
         writer.close()
-        await writer.wait_closed()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
