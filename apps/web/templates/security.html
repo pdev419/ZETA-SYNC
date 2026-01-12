@@ -7,7 +7,7 @@
   </head>
   <body>
     <div class="wrap">
-      <h1>Security (M3)</h1>
+      <h1>Security (M3) — UI-only mTLS</h1>
 
       <div class="nav">
         <a href="/">Home</a>
@@ -17,28 +17,34 @@
       </div>
 
       <div class="card">
-        <h2>Cluster CA</h2>
-        <p>Initialize CA once, then use it to issue node cert bundles.</p>
+        <h2>1) Cluster CA (Authority node)</h2>
+        <p>Pick ONE node as Authority. Initialize CA and create a bootstrap token.</p>
         <div class="row">
           <button onclick="caInit()">Init CA</button>
           <button onclick="caShow()">Show CA cert</button>
+          <button onclick="bootstrapCreate()">Create Bootstrap Token</button>
         </div>
         <pre id="ca"></pre>
+        <pre id="token"></pre>
       </div>
 
       <div class="card">
-        <h2>Issue node cert bundle</h2>
+        <h2>2) Provision THIS node (no copy/paste PEM)</h2>
+        <p>On a new node: enter Authority URL + Token and click Provision.</p>
         <div class="row">
-          <input id="issueNodeId" placeholder="node-id (e.g. node-A)" style="min-width:260px;" />
-          <button onclick="issueCert()">Issue</button>
+          <input id="authorityUrl" placeholder="Authority URL (e.g. http://192.168.2.126:8080)" style="min-width:420px;" />
+          <input id="bootstrapToken" placeholder="Bootstrap token" style="min-width:320px;" />
         </div>
-        <p>Copy the returned PEMs into the target node:</p>
-        <code>data/state/tls/ca.crt</code>, <code>data/state/tls/node.crt</code>, <code>data/state/tls/node.key</code>
-        <pre id="issue"></pre>
+        <div class="row">
+          <button onclick="provisionThisNode()">Provision this node</button>
+          <button onclick="restartService()">Restart service</button>
+        </div>
+        <pre id="provisionOut"></pre>
       </div>
 
       <div class="card">
-        <h2>Pending nodes (Approve/Deny)</h2>
+        <h2>3) Pending nodes (Approve/Deny)</h2>
+        <p>After provisioning + restart, nodes will appear as Pending until approved (allowlist).</p>
         <div class="row">
           <button onclick="loadPending()">Refresh pending</button>
         </div>
@@ -72,11 +78,36 @@
         const res = await apiCall("GET", "/mgmt/security/ca/cert");
         document.getElementById("ca").textContent = res.ca_cert_pem || JSON.stringify(res, null, 2);
       }
-      async function issueCert() {
-        const nodeId = document.getElementById("issueNodeId").value.trim();
-        if (!nodeId) return alert("Enter node_id");
-        const res = await apiCall("POST", "/mgmt/security/nodes/issue?node_id=" + encodeURIComponent(nodeId));
-        document.getElementById("issue").textContent = JSON.stringify(res, null, 2);
+      async function bootstrapCreate() {
+        const res = await apiCall("POST", "/mgmt/security/bootstrap/token/create");
+        document.getElementById("token").textContent =
+          "BOOTSTRAP TOKEN (share to other nodes, show once):\n\n" + (res.token || JSON.stringify(res, null, 2));
+      }
+
+      async function provisionThisNode() {
+        const authority = document.getElementById("authorityUrl").value.trim();
+        const token = document.getElementById("bootstrapToken").value.trim();
+        if (!authority) return alert("Enter Authority URL");
+        if (!token) return alert("Enter Bootstrap token");
+
+        // get local node_id automatically
+        const st = await fetch("/api/v1/cluster/status").then(r => r.json());
+        const nodeId = st.node_id;
+        if (!nodeId) return alert("Local node_id not found");
+
+        // 1) Ask authority to issue bundle for this node_id
+        const bundle = await authorityIssueBundle(authority, nodeId, token);
+
+        // 2) Install bundle locally (writes files to data/state/tls/)
+        const installed = await apiCall("POST", "/mgmt/security/local/install-bundle", bundle);
+
+        document.getElementById("provisionOut").textContent =
+          "Provision OK.\n\nNext: click 'Restart service'.\n\n" + JSON.stringify({ bundle_meta: bundle.meta, installed }, null, 2);
+      }
+
+      async function restartService() {
+        const res = await apiCall("POST", "/mgmt/system/restart");
+        document.getElementById("provisionOut").textContent = "Restart requested.\n" + JSON.stringify(res, null, 2);
       }
 
       function pendingRow(key, item) {
@@ -98,8 +129,7 @@
           if (!approveId) return alert("Enter approve node_id");
           const res = await apiCall("POST", "/mgmt/security/nodes/approve?node_id=" + encodeURIComponent(approveId) + "&pending_key=" + encodeURIComponent(key));
           alert("Approved: " + JSON.stringify(res));
-          loadPending();
-          loadSecurityState();
+          loadPending(); loadSecurityState();
         };
         div.querySelector(".denyBtn").onclick = async () => {
           const res = await apiCall("POST", "/mgmt/security/nodes/deny?pending_key=" + encodeURIComponent(key));
@@ -115,10 +145,7 @@
         const box = document.getElementById("pendingList");
         box.innerHTML = "";
         const keys = Object.keys(pending);
-        if (!keys.length) {
-          box.textContent = "No pending nodes.";
-          return;
-        }
+        if (!keys.length) { box.textContent = "No pending nodes."; return; }
         keys.forEach(k => box.appendChild(pendingRow(k, pending[k])));
       }
 
