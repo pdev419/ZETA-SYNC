@@ -1,55 +1,171 @@
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>ZETA-SYNC</title>
-    <link rel="stylesheet" href="/static/app.css" />
-  </head>
-  <body>
-    <div class="wrap">
-      <h1>ZETA-SYNC Control</h1>
+<head>
+  <meta charset="utf-8" />
+  <title>ZETA-SYNC</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{
+      --bg:#0b1220; --card:#0f172a; --border:#1f2937; --text:#e5e7eb; --muted:#94a3b8;
+      --blue:#2563eb; --gray:#334155; --red:#dc2626; --green:#22c55e; --amber:#fbbf24;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:ui-sans-serif,system-ui;background:var(--bg);color:var(--text)}
+    header{position:sticky;top:0;z-index:5;background:rgba(15,23,42,.9);backdrop-filter: blur(8px);
+      border-bottom:1px solid var(--border); padding:14px 18px; display:flex; align-items:center; gap:14px;}
+    header .brand{font-weight:800; letter-spacing:.2px}
+    nav a{color:var(--muted); text-decoration:none; margin-right:10px; font-size:14px}
+    nav a:hover{color:var(--text)}
+    .wrap{max-width:1100px;margin:0 auto;padding:18px}
+    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
+    .title{font-size:16px;font-weight:800}
+    .sub{font-size:12px;color:var(--muted);margin-top:2px}
+    .pill{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;
+      border:1px solid var(--border); font-size:12px; color:var(--text)}
+    .dot{width:8px;height:8px;border-radius:999px;background:var(--amber)}
+    .dot.ok{background:var(--green)} .dot.warn{background:var(--amber)} .dot.bad{background:var(--red)}
+    .kpi{display:flex;flex-direction:column;gap:4px;padding:12px;border-radius:12px;background:#0b1220;border:1px solid var(--border)}
+    .kpi .label{font-size:12px;color:var(--muted)}
+    .kpi .value{font-size:20px;font-weight:800}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    button{border:0;border-radius:12px;padding:10px 12px;color:white;cursor:pointer;font-weight:700}
+    button.primary{background:var(--blue)}
+    button.secondary{background:var(--gray)}
+    button.danger{background:var(--red)}
+    input{width:100%;padding:10px 12px;border-radius:12px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
+    pre{margin:0;background:#0b1220;border:1px solid var(--border);padding:12px;border-radius:12px;overflow:auto;font-family:var(--mono);font-size:12px;color:#cbd5e1}
+    .right{margin-left:auto}
+    .small{font-size:12px;color:var(--muted)}
+    .link{color:#93c5fd;text-decoration:none}
+  </style>
+</head>
+<body>
+<header>
+  <div class="brand">ZETA-SYNC</div>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/nodes">Nodes</a>
+    <a href="/events">Events</a>
+    <a href="/security">Security</a>
+  </nav>
+  <div class="right small" id="hint">M4</div>
+</header>
 
-      <div class="nav">
-        <a href="/">Home</a>
-        <a href="/nodes">Nodes</a>
-        <a href="/events">Events</a>
-        <a href="/security">Security (M3)</a>
-      </div>
-
-      <div class="card">
-        <h2>Cluster controls</h2>
-        <p>These require Admin login (Basic Auth).</p>
-        <div class="row">
-          <button onclick="mgmtStart()">Start Sync</button>
-          <button onclick="mgmtStop()">Stop Sync</button>
+<div class="wrap">
+  <div class="grid">
+    <div class="card" style="grid-column: span 7;">
+      <div class="row" style="justify-content:space-between;">
+        <div>
+          <div class="title">Cluster</div>
+          <div class="sub">Health • quorum • reference • exclusions</div>
         </div>
-        <pre id="out"></pre>
+        <span class="pill" id="healthPill"><span class="dot"></span><span>Loading...</span></span>
       </div>
 
-      <div class="card">
-        <h2>Status</h2>
-        <div class="row">
-          <button onclick="loadStatus()">Refresh</button>
+      <div style="height:12px;"></div>
+
+      <div class="grid">
+        <div class="kpi" style="grid-column: span 6;">
+          <div class="label">Quorum</div>
+          <div class="value" id="quorum">-</div>
         </div>
-        <pre id="status"></pre>
+        <div class="kpi" style="grid-column: span 6;">
+          <div class="label">Active</div>
+          <div class="value" id="active">-</div>
+        </div>
+        <div class="kpi" style="grid-column: span 6;">
+          <div class="label">Reference Z</div>
+          <div class="value" id="refZ">-</div>
+          <div class="small" id="refMethod">-</div>
+        </div>
+        <div class="kpi" style="grid-column: span 6;">
+          <div class="label">Excluded</div>
+          <div class="value" style="font-size:14px" id="excluded">none</div>
+          <div class="small" id="excludeReasons">-</div>
+        </div>
       </div>
+
+      <div style="height:12px;"></div>
+      <div class="small">Open <a class="link" href="/nodes">Nodes</a> for member states (ACTIVE / RECOVERING / OFFLINE).</div>
     </div>
 
-    <script src="/static/app.js"></script>
-    <script>
-      async function mgmtStart() {
-        const res = await apiCall("POST", "/mgmt/cluster/start");
-        document.getElementById("out").textContent = JSON.stringify(res, null, 2);
-      }
-      async function mgmtStop() {
-        const res = await apiCall("POST", "/mgmt/cluster/stop");
-        document.getElementById("out").textContent = JSON.stringify(res, null, 2);
-      }
-      async function loadStatus() {
-        const res = await fetch("/api/v1/cluster/status").then(r => r.json());
-        document.getElementById("status").textContent = JSON.stringify(res, null, 2);
-      }
-      loadStatus();
-    </script>
-  </body>
+    <div class="card" style="grid-column: span 5;">
+      <div class="title">Quick Controls</div>
+
+      <div style="height:10px;"></div>
+      <div class="row">
+        <button class="primary" onclick="mgmtStart()">Start Sync</button>
+        <button class="danger" onclick="mgmtStop()">Stop Sync</button>
+        <button class="secondary" onclick="refreshAll()">Refresh</button>
+      </div>
+      
+      <div style="height:12px;"></div>
+      <pre id="result">{}</pre>
+    </div>
+  </div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  async function apiGet(url){
+    const r = await fetch(url, {cache:"no-store"});
+    if(!r.ok) throw new Error(url+" -> "+r.status);
+    return await r.json();
+  }
+
+  function setHealth(health){
+    const pill = $("healthPill");
+    const dot = pill.querySelector(".dot");
+    const txt = pill.querySelector("span:last-child");
+    const h = String(health||"UNKNOWN").toUpperCase();
+    txt.textContent = h;
+    dot.className = "dot";
+    if(h==="HEALTHY") dot.classList.add("ok");
+    else if(h==="DEGRADED") dot.classList.add("warn");
+    else if(h==="OFFLINE") dot.classList.add("bad");
+    else dot.classList.add("warn");
+  }
+
+  async function loadCluster(){
+    let h = null;
+    try { h = await apiGet("/api/v1/cluster/health"); }
+    catch { h = await apiGet("/api/v1/cluster/status"); }
+
+    setHealth(h.cluster_health);
+    $("quorum").textContent = h.quorum || "-";
+    $("active").textContent = `${h.active_nodes ?? "-"} / ${h.expected_nodes ?? "-"}`;
+    $("excluded").textContent = (h.excluded_nodes && h.excluded_nodes.length) ? h.excluded_nodes.join(", ") : "none";
+    $("excludeReasons").textContent = h.exclude_reasons ? JSON.stringify(h.exclude_reasons) : "-";
+
+    try{
+      const ref = await apiGet("/api/v1/cluster/reference");
+      $("refZ").textContent = (ref.reference_z ?? "-");
+      $("refMethod").textContent = ref.reference_method ? `method: ${ref.reference_method}` : "-";
+    } catch {
+      $("refZ").textContent = (h.reference_z ?? "-");
+      $("refMethod").textContent = h.reference_method ? `method: ${h.reference_method}` : "-";
+    }
+  }
+
+  async function mgmtPost(url){
+    const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    const t = await r.text();
+    try { return JSON.parse(t); } catch { return {status:r.status, raw:t}; }
+  }
+
+  async function mgmtStart(){ $("result").textContent = JSON.stringify(await mgmtPost("/mgmt/cluster/start"), null, 2); }
+  async function mgmtStop(){ $("result").textContent = JSON.stringify(await mgmtPost("/mgmt/cluster/stop"), null, 2); }
+
+  async function refreshAll(){
+    try { await loadCluster(); }
+    catch(e){ $("result").textContent = JSON.stringify({ok:false,error:String(e)}, null, 2); }
+  }
+
+  refreshAll();
+  setInterval(refreshAll, 2000);
+</script>
+</body>
 </html>

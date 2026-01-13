@@ -1,42 +1,137 @@
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>ZETA-SYNC Nodes</title>
-    <link rel="stylesheet" href="/static/app.css" />
-  </head>
-  <body>
-    <div class="wrap">
-      <h1>Nodes</h1>
+<head>
+  <meta charset="utf-8" />
+  <title>Nodes - ZETA-SYNC</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{--bg:#0b1220;--card:#0f172a;--border:#1f2937;--text:#e5e7eb;--muted:#94a3b8;
+      --green:#22c55e;--amber:#fbbf24;--red:#ef4444;--mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:ui-sans-serif,system-ui;background:var(--bg);color:var(--text)}
+    header{position:sticky;top:0;background:rgba(15,23,42,.9);backdrop-filter: blur(8px);
+      border-bottom:1px solid var(--border); padding:14px 18px; display:flex; align-items:center; gap:14px;}
+    nav a{color:var(--muted); text-decoration:none; margin-right:10px; font-size:14px}
+    nav a:hover{color:var(--text)}
+    .wrap{max-width:1100px;margin:0 auto;padding:18px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
+    .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+    .title{font-weight:800}
+    .sub{font-size:12px;color:var(--muted)}
+    button{border:0;border-radius:12px;padding:8px 10px;color:white;cursor:pointer;background:#334155;font-weight:700}
+    .right{margin-left:auto}
+    .pill{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid var(--border);font-size:12px}
+    .dot{width:8px;height:8px;border-radius:999px;background:var(--amber)}
+    .dot.ok{background:var(--green)} .dot.warn{background:var(--amber)} .dot.bad{background:var(--red)}
+    table{width:100%;border-collapse:collapse;margin-top:10px}
+    th,td{padding:10px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+    th{font-size:12px;color:var(--muted);font-weight:700}
+    td{font-size:13px}
+    .mono{font-family:var(--mono)}
+    .state{font-weight:800}
+  </style>
+</head>
+<body>
+<header>
+  <div style="font-weight:800;">ZETA-SYNC</div>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/nodes">Nodes</a>
+    <a href="/events">Events</a>
+    <a href="/security">Security</a>
+  </nav>
+  <div class="right row">
+    <span class="pill" id="healthPill"><span class="dot"></span><span>Loading...</span></span>
+    <button onclick="refreshAll()">Refresh</button>
+  </div>
+</header>
 
-      <div class="nav">
-        <a href="/">Home</a>
-        <a href="/nodes">Nodes</a>
-        <a href="/events">Events</a>
-        <a href="/security">Security</a>
+<div class="wrap">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;">
+      <div>
+        <div class="title">Nodes</div>
+        <div class="sub">Only identified nodes (no null node_id)</div>
       </div>
-
-      <div class="card">
-        <div class="row">
-          <button onclick="loadNodes()">Refresh</button>
-          <label style="display:flex;gap:8px;align-items:center;">
-            <input id="unknown" type="checkbox" />
-            Show unknown peers
-          </label>
-        </div>
-        <pre id="nodes"></pre>
-      </div>
+      <div class="sub" id="summary">-</div>
     </div>
 
-    <script src="/static/app.js"></script>
-    <script>
-      async function loadNodes() {
-        const includeUnknown = document.getElementById("unknown").checked ? "1" : "0";
-        const res = await fetch("/api/v1/nodes?include_unknown=" + includeUnknown).then(r => r.json());
-        document.getElementById("nodes").textContent = JSON.stringify(res, null, 2);
-      }
-      setInterval(loadNodes, 1000);
-      loadNodes();
-    </script>
-  </body>
+    <table>
+      <thead>
+        <tr>
+          <th>node_id</th>
+          <th>peer_addr</th>
+          <th>state</th>
+          <th>online</th>
+          <th>excluded</th>
+          <th>z</th>
+          <th>stability</th>
+          <th>ppm</th>
+          <th>seq</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  async function apiGet(url){
+    const r = await fetch(url,{cache:"no-store"});
+    if(!r.ok) throw new Error(url+" -> "+r.status);
+    return await r.json();
+  }
+  function setHealth(health){
+    const pill = $("healthPill");
+    const dot = pill.querySelector(".dot");
+    const txt = pill.querySelector("span:last-child");
+    const h = String(health||"UNKNOWN").toUpperCase();
+    txt.textContent = h;
+    dot.className = "dot";
+    if(h==="HEALTHY") dot.classList.add("ok");
+    else if(h==="DEGRADED") dot.classList.add("warn");
+    else if(h==="OFFLINE") dot.classList.add("bad");
+    else dot.classList.add("warn");
+  }
+  function fmt(x,d=6){ return (typeof x==="number") ? x.toFixed(d) : (x ?? "-"); }
+
+  async function refreshAll(){
+    let ch=null;
+    try { ch = await apiGet("/api/v1/cluster/health"); }
+    catch { ch = await apiGet("/api/v1/cluster/status"); }
+    setHealth(ch.cluster_health);
+    $("summary").textContent = `quorum ${ch.quorum || "-"} • active ${ch.active_nodes ?? "-"} / ${ch.expected_nodes ?? "-"}`;
+
+    const data = await apiGet("/api/v1/nodes");
+    const nodes = (data.nodes || []).filter(n => n && n.node_id); // remove null node_id
+    const tb = $("tbody");
+    tb.innerHTML = "";
+
+    for(const n of nodes){
+      const m = n.metrics || {};
+      const state = n.state || n.membership_state || n.membership?.state || n.status || "-";
+      const online = (n.online === false) ? "false" : "true";
+      const reason = n.reason || n.exclude_reason || n.membership?.reason || "";
+      tb.insertAdjacentHTML("beforeend", `
+        <tr>
+          <td class="mono">${n.node_id}</td>
+          <td class="mono">${n.peer_addr || "-"}</td>
+          <td><span class="state">${String(state).toUpperCase()}</span></td>
+          <td>${online}</td>
+          <td>${n.excluded ? ("true" + (reason?` (${reason})`:"")) : "false"}</td>
+          <td class="mono">${fmt(m.z,8)}</td>
+          <td class="mono">${fmt(m.stability,6)}</td>
+          <td class="mono">${fmt(m.ppm_offset,6)}</td>
+          <td class="mono">${m.sequence ?? "-"}</td>
+        </tr>
+      `);
+    }
+  }
+
+  refreshAll();
+  setInterval(refreshAll, 2000);
+</script>
+</body>
 </html>
