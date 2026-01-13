@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import secrets
 import socket
 import time
 from contextlib import asynccontextmanager
@@ -13,16 +12,15 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 
 from node.agent.discovery import Discovery, parse_hostport
-from node.cluster.membership import MembershipTracker  # ✅ M4 (new module)
+from node.cluster.membership import MembershipTracker
 from node.constants import ENV_FILE, EVENTS_LOG, LOG_DIR, METRICS_LOG, PROJECT_ROOT
 from node.peer.client import send_message
 from node.peer.server import PeerServer
@@ -264,19 +262,6 @@ class NodeRuntime:
             "advertise_addr": self.advertise_addr(),
             "known_peers": sorted(self.discovery.known_peers),
         }
-
-
-security_basic = HTTPBasic()
-
-
-def require_admin(creds: HTTPBasicCredentials = Depends(security_basic)):
-    user = os.getenv("ADMIN_USER", "admin")
-    pw = os.getenv("ADMIN_PASS", "admin123")
-    ok_user = secrets.compare_digest(creds.username, user)
-    ok_pw = secrets.compare_digest(creds.password, pw)
-    if not (ok_user and ok_pw):
-        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
-    return True
 
 
 async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) -> dict:
@@ -594,7 +579,7 @@ def create_app() -> FastAPI:
     async def ui_security(request: Request):
         return templates.TemplateResponse("security.html", {"request": request})
 
-    @app.post("/mgmt/cluster/start", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/cluster/start")
     async def mgmt_start():
         try:
             await app.state.ctx.start_sync()
@@ -602,12 +587,12 @@ def create_app() -> FastAPI:
         except RuntimeError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-    @app.post("/mgmt/cluster/stop", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/cluster/stop")
     async def mgmt_stop():
         await app.state.ctx.stop_sync()
         return {"ok": True}
 
-    @app.post("/mgmt/security/ca/init", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/security/ca/init")
     async def mgmt_ca_init():
         ca_days = int(os.getenv("TLS_CA_VALIDITY_DAYS", "3650"))
         ensure_cluster_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path), validity_days=ca_days)
@@ -639,13 +624,13 @@ def create_app() -> FastAPI:
             "next_step": "Click 'Restart service' so TLS contexts load.",
         }
 
-    @app.get("/mgmt/security/ca/cert", dependencies=[Depends(require_admin)])
+    @app.get("/mgmt/security/ca/cert")
     async def mgmt_ca_cert():
         if not app.state.ca_cert_path.exists():
             raise HTTPException(status_code=404, detail="CA cert missing, init first")
         return {"ca_cert_pem": app.state.ca_cert_path.read_text(encoding="utf-8")}
 
-    @app.post("/mgmt/security/nodes/issue", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/security/nodes/issue")
     async def mgmt_issue_node_cert(node_id: str):
         ca_key, ca_cert = load_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path))
         node_key_pem, node_cert_pem = issue_node_cert(
@@ -658,7 +643,7 @@ def create_app() -> FastAPI:
             "node_key_pem": node_key_pem.decode("utf-8"),
         }
 
-    @app.post("/mgmt/security/nodes/sign-csr", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/security/nodes/sign-csr")
     async def mgmt_sign_csr(csr_pem: str):
         ca_key, ca_cert = load_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path))
         cert_pem = sign_csr(ca_key, ca_cert, csr_pem.encode("utf-8"), validity_days=app.state.node_validity_days)
@@ -667,12 +652,12 @@ def create_app() -> FastAPI:
             "ca_cert_pem": app.state.ca_cert_path.read_text(encoding="utf-8"),
         }
 
-    @app.get("/mgmt/security/nodes/pending", dependencies=[Depends(require_admin)])
+    @app.get("/mgmt/security/nodes/pending")
     async def mgmt_pending():
         rec = app.state.security_store.load()
         return {"pending": rec.pending}
 
-    @app.post("/mgmt/security/nodes/approve", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/security/nodes/approve")
     async def mgmt_approve(node_id: str, pending_key: str):
         rec = app.state.security_store.load()
         info = rec.pending.get(pending_key)
@@ -683,19 +668,19 @@ def create_app() -> FastAPI:
         app.state.ctx.log_event("NODE_APPROVED", node_id=node_id)
         return {"ok": True}
 
-    @app.post("/mgmt/security/nodes/deny", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/security/nodes/deny")
     async def mgmt_deny(pending_key: str, reason: str = "denied"):
         app.state.security_store.deny_pending(pending_key, reason=reason)
         app.state.ctx.log_event("NODE_DENIED", severity="WARNING", fingerprint=pending_key, reason=reason)
         return {"ok": True}
 
-    @app.post("/mgmt/security/nodes/block", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/security/nodes/block")
     async def mgmt_block(node_id: str, reason: str = "revoked"):
         app.state.security_store.block_node(node_id=node_id, reason=reason)
         app.state.ctx.log_event("NODE_BLOCKED", severity="WARNING", node_id=node_id, reason=reason)
         return {"ok": True}
 
-    @app.get("/mgmt/security/state", dependencies=[Depends(require_admin)])
+    @app.get("/mgmt/security/state")
     async def mgmt_security_state():
         rec = app.state.security_store.load()
         return {
@@ -705,7 +690,7 @@ def create_app() -> FastAPI:
             "bootstrap": rec.bootstrap,
         }
 
-    @app.post("/mgmt/security/bootstrap/token/create", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/security/bootstrap/token/create")
     async def mgmt_bootstrap_token_create():
         token = app.state.security_store.create_bootstrap_token()
         app.state.ctx.log_event("BOOTSTRAP_TOKEN_CREATED", severity="WARNING")
@@ -750,7 +735,7 @@ def create_app() -> FastAPI:
             },
         }
 
-    @app.post("/mgmt/security/local/install-bundle", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/security/local/install-bundle")
     async def mgmt_local_install_bundle(payload: Dict[str, Any]):
         ca_pem = str(payload.get("ca_cert_pem") or "")
         node_cert_pem = str(payload.get("node_cert_pem") or "")
@@ -778,7 +763,7 @@ def create_app() -> FastAPI:
             ],
         }
 
-    @app.post("/mgmt/system/restart", dependencies=[Depends(require_admin)])
+    @app.post("/mgmt/system/restart")
     async def mgmt_system_restart(background: BackgroundTasks):
         app.state.ctx.log_event("SYSTEM_RESTART_REQUESTED", severity="WARNING")
 

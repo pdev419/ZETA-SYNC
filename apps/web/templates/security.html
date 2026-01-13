@@ -123,19 +123,13 @@
     return await r.json();
   }
 
-  function authHeader(){
-    const u = $("adminUser").value || "admin";
-    const p = $("adminPass").value || "admin123";
-    return {"Authorization":"Basic "+btoa(`${u}:${p}`)};
-  }
-
   async function mgmtGet(url){
-    const r = await fetch(url,{headers:authHeader(),cache:"no-store"});
+    const r = await fetch(url,{cache:"no-store"});
     const t = await r.text();
     try { return JSON.parse(t); } catch { return {status:r.status, raw:t}; }
   }
   async function mgmtPost(url, body){
-    const r = await fetch(url,{method:"POST",headers:{"Content-Type":"application/json",...authHeader()},body:JSON.stringify(body||{})});
+    const r = await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
     const t = await r.text();
     try { return JSON.parse(t); } catch { return {status:r.status, raw:t}; }
   }

@@ -93,7 +93,6 @@
 
     <div class="card" style="grid-column: span 5;">
       <div class="title">Quick Controls</div>
-      <div class="sub">Admin Basic Auth (.env ADMIN_USER / ADMIN_PASS)</div>
 
       <div style="height:10px;"></div>
       <div class="row">
@@ -101,13 +100,7 @@
         <button class="danger" onclick="mgmtStop()">Stop Sync</button>
         <button class="secondary" onclick="refreshAll()">Refresh</button>
       </div>
-
-      <div style="height:12px;"></div>
-      <div class="grid">
-        <div style="grid-column: span 6;"><input id="adminUser" placeholder="admin user" /></div>
-        <div style="grid-column: span 6;"><input id="adminPass" placeholder="admin pass" type="password" /></div>
-      </div>
-
+      
       <div style="height:12px;"></div>
       <pre id="result">{}</pre>
     </div>
@@ -157,14 +150,8 @@
     }
   }
 
-  function authHeader(){
-    const u = $("adminUser").value || "admin";
-    const p = $("adminPass").value || "admin123";
-    return {"Authorization":"Basic "+btoa(`${u}:${p}`)};
-  }
-
   async function mgmtPost(url){
-    const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json", ...authHeader()}, body:"{}"});
+    const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
     const t = await r.text();
     try { return JSON.parse(t); } catch { return {status:r.status, raw:t}; }
   }
