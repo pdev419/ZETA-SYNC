@@ -486,7 +486,7 @@ def create_app() -> FastAPI:
 
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
-    app = FastAPI(title="ZETA-SYNC Cluster (M4)", lifespan=None)
+    app = FastAPI(title="ZETA-SYNC Cluster", lifespan=None)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

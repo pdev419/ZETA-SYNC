@@ -1,229 +1,277 @@
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8" />
-  <title>Security - ZETA-SYNC</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    :root{--bg:#0b1220;--card:#0f172a;--border:#1f2937;--text:#e5e7eb;--muted:#94a3b8;
-      --blue:#2563eb;--gray:#334155;--red:#dc2626;--green:#22c55e;--amber:#fbbf24;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;}
-    *{box-sizing:border-box}
-    body{margin:0;font-family:ui-sans-serif,system-ui;background:var(--bg);color:var(--text)}
-    header{position:sticky;top:0;background:rgba(15,23,42,.9);backdrop-filter: blur(8px);
-      border-bottom:1px solid var(--border); padding:14px 18px; display:flex; align-items:center; gap:14px;}
-    nav a{color:var(--muted); text-decoration:none; margin-right:10px; font-size:14px}
-    nav a:hover{color:var(--text)}
-    .wrap{max-width:1100px;margin:0 auto;padding:18px}
-    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
-    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
-    .title{font-weight:800}
-    .sub{font-size:12px;color:var(--muted);margin-top:2px}
-    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-    button{border:0;border-radius:12px;padding:10px 12px;color:white;cursor:pointer;font-weight:800}
-    button.primary{background:var(--blue)}
-    button.secondary{background:var(--gray)}
-    button.danger{background:var(--red)}
-    input{width:100%;padding:10px 12px;border-radius:12px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
-    pre{margin:0;background:#0b1220;border:1px solid var(--border);padding:12px;border-radius:12px;overflow:auto;font-family:var(--mono);font-size:12px;color:#cbd5e1}
-    table{width:100%;border-collapse:collapse;margin-top:10px}
-    th,td{padding:10px 8px;border-bottom:1px solid var(--border);vertical-align:top}
-    th{font-size:12px;color:var(--muted);font-weight:800}
-    td{font-size:13px}
-    .mono{font-family:var(--mono)}
-    .pill{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid var(--border);font-size:12px}
-    .dot{width:8px;height:8px;border-radius:999px;background:var(--amber)}
-    .dot.ok{background:var(--green)} .dot.warn{background:var(--amber)}
-    .right{margin-left:auto}
-  </style>
-</head>
-<body>
-<header>
-  <div style="font-weight:800;">ZETA-SYNC</div>
-  <nav>
-    <a href="/">Home</a>
-    <a href="/nodes">Nodes</a>
-    <a href="/events">Events</a>
-    <a href="/security">Security</a>
-  </nav>
-  <div class="right" id="tlsPill"></div>
-</header>
+  <head>
+    <meta charset="utf-8" />
+    <title>ZETA-SYNC Security</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
 
-<div class="wrap">
-  <div class="grid">
-    <div class="card" style="grid-column: span 5;">
-      <div class="title">Admin Login</div>
-      <div class="sub">Used for management actions</div>
-      <div style="height:10px;"></div>
-      <div class="row">
-        <button class="secondary" onclick="refreshAll()">Refresh</button>
-        <button class="primary" onclick="createToken()">Create Token</button>
+  <body>
+    <div class="wrap">
+      <h1>Security</h1>
+
+      <div class="nav">
+        <a href="/">Home</a>
+        <a href="/nodes">Nodes</a>
+        <a href="/events">Events</a>
+        <a href="/security">Security</a>
       </div>
-      <div style="height:10px;"></div>
-      <pre id="result">{}</pre>
-    </div>
 
-    <div class="card" style="grid-column: span 7;">
-      <div class="title">Join (No cert copy/paste)</div>
-      <div class="sub">Paste only: remote URL + token → Pull + Install → Restart</div>
-      <div style="height:10px;"></div>
-      <div class="grid">
-        <div style="grid-column: span 8;">
-          <input id="remoteUrl" placeholder="Remote URL (e.g. http://192.168.2.126:8080)" />
+      <div id="topStatus" class="row"></div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>0) Status</h2>
+            <div class="muted">Check TLS state and local identity.</div>
+          </div>
+          <div class="row">
+            <button class="smallbtn" onclick="refreshStatus()">Refresh</button>
+            <button class="smallbtn btn-primary" onclick="restartService()">Restart service</button>
+          </div>
         </div>
-        <div style="grid-column: span 4;">
-          <input id="token" placeholder="token" />
+        <div class="grid2">
+          <div>
+            <div class="muted2">Local</div>
+            <pre id="localInfo">loading…</pre>
+          </div>
+          <div>
+            <div class="muted2">TLS</div>
+            <pre id="tlsInfo">loading…</pre>
+          </div>
         </div>
       </div>
-      <div style="height:10px;"></div>
-      <div class="row">
-        <button class="primary" onclick="pullInstall()">Pull + Install</button>
-        <button class="danger" onclick="restartService()">Restart (PM2)</button>
-      </div>
-      <div style="height:10px;"></div>
-      <div class="sub">After restart, trigger connection (nodes will appear in Pending on the cluster).</div>
-    </div>
 
-    <div class="card" style="grid-column: span 12;">
-      <div class="row" style="justify-content:space-between;">
-        <div>
-          <div class="title">Pending</div>
-          <div class="sub">Approve join requests (allowlist)</div>
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>1) Authority node (CA)</h2>
+            <div class="muted">Do this on ONE node only.</div>
+          </div>
+          <div class="row">
+            <button class="smallbtn btn-primary" onclick="caInit()">Init CA + Self Identity</button>
+            <button class="smallbtn" onclick="caShow()">Show CA cert</button>
+            <button class="smallbtn" onclick="bootstrapCreate()">Create Bootstrap Token</button>
+            <button class="smallbtn btn-ghost" onclick="copyTextFromEl('token')">Copy token</button>
+          </div>
         </div>
-        <button class="secondary" onclick="loadPending()">Refresh Pending</button>
+        <pre id="ca"></pre>
+        <pre id="token"></pre>
       </div>
 
-      <table>
-        <thead>
-          <tr>
-            <th>pending_key</th>
-            <th>node_id</th>
-            <th>peer</th>
-            <th>last_seen</th>
-            <th>action</th>
-          </tr>
-        </thead>
-        <tbody id="pendingBody"></tbody>
-      </table>
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>2) Provision THIS node</h2>
+            <div class="muted">No copy/paste PEM. Just Authority URL + Token.</div>
+          </div>
+          <div class="row">
+            <button class="smallbtn" onclick="provisionThisNode()">Provision this node</button>
+            <button class="smallbtn btn-primary" onclick="restartService()">Restart service</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <input id="authorityUrl" placeholder="Authority URL (e.g. http://192.168.2.126:8080)" style="min-width:420px;" />
+          <input id="bootstrapToken" placeholder="Bootstrap token" style="min-width:320px;" />
+        </div>
+
+        <pre id="provisionOut"></pre>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>3) Pending nodes</h2>
+            <div class="muted">Approve nodes to allow them to join.</div>
+          </div>
+          <div class="row">
+            <button class="smallbtn" onclick="loadPending()">Refresh pending</button>
+            <button class="smallbtn" onclick="loadSecurityState()">Refresh allow/block</button>
+          </div>
+        </div>
+        <div id="pendingList"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>4) Allowlist / Blocklist</h2>
+            <div class="muted">View current security state and revoke nodes.</div>
+          </div>
+          <div class="row">
+            <button class="smallbtn" onclick="loadSecurityState()">Refresh</button>
+            <button class="smallbtn btn-ghost" onclick="copyTextFromEl('state')">Copy JSON</button>
+          </div>
+        </div>
+
+        <pre id="state"></pre>
+
+        <h3>Block node</h3>
+        <div class="row">
+          <input id="blockNodeId" placeholder="node-id to block" style="min-width:260px;" />
+          <input id="blockReason" placeholder="reason (optional)" style="min-width:260px;" />
+          <button class="btn-danger" onclick="blockNode()">Block</button>
+        </div>
+        <pre id="blockOut"></pre>
+      </div>
     </div>
-  </div>
-</div>
 
-<script>
-  const $ = (id) => document.getElementById(id);
+    <script src="/static/app.js"></script>
+    <script>
+      async function topStatus(){
+        const box = document.getElementById("topStatus");
+        try{
+          const st = await fetch("/api/v1/cluster/status",{cache:"no-store"}).then(r=>r.json());
+          const h = await fetch("/api/v1/health",{cache:"no-store"}).then(r=>r.json());
+          box.innerHTML =
+            pillHtml(h.tls_enabled ? "TLS enabled" : "TLS disabled", h.tls_enabled ? "ok" : "warn") +
+            ` ${pillHtml(st.node_id || "node", "warn")}` +
+            ` ${pillHtml(st.advertise_addr || "advertise", "warn")}`;
+        }catch(e){
+          box.innerHTML = pillHtml("status error", "bad");
+        }
+      }
 
-  async function apiGet(url){
-    const r = await fetch(url,{cache:"no-store"});
-    if(!r.ok) throw new Error(url+" -> "+r.status);
-    return await r.json();
-  }
+      async function refreshStatus(){
+        await topStatus();
+        const st = await fetch("/api/v1/cluster/status",{cache:"no-store"}).then(r=>r.json());
+        const h = await fetch("/api/v1/health",{cache:"no-store"}).then(r=>r.json());
+        document.getElementById("localInfo").textContent = JSON.stringify(st, null, 2);
+        document.getElementById("tlsInfo").textContent = JSON.stringify(h, null, 2);
+      }
 
-  async function mgmtGet(url){
-    const r = await fetch(url,{cache:"no-store"});
-    const t = await r.text();
-    try { return JSON.parse(t); } catch { return {status:r.status, raw:t}; }
-  }
-  async function mgmtPost(url, body){
-    const r = await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
-    const t = await r.text();
-    try { return JSON.parse(t); } catch { return {status:r.status, raw:t}; }
-  }
+      async function caInit(){
+        const res = await apiCall("POST", "/mgmt/security/ca/init");
+        document.getElementById("ca").textContent = JSON.stringify(res, null, 2);
+        await refreshStatus();
+      }
 
-  function setTls(on){
-    $("tlsPill").innerHTML = `<span class="pill"><span class="dot ${on?"ok":"warn"}"></span><span>TLS ${on?"ENABLED":"DISABLED"}</span></span>`;
-  }
+      async function caShow(){
+        const res = await apiCall("GET", "/mgmt/security/ca/cert");
+        document.getElementById("ca").textContent = res.ca_cert_pem || JSON.stringify(res, null, 2);
+      }
 
-  function fmtTs(ts){
-    if(!ts) return "-";
-    return new Date(ts*1000).toLocaleString();
-  }
+      async function bootstrapCreate(){
+        const res = await apiCall("POST", "/mgmt/security/bootstrap/token/create");
+        document.getElementById("token").textContent = res.token || JSON.stringify(res, null, 2);
+      }
 
-  async function refreshAll(){
-    try{
-      const h = await apiGet("/api/v1/health");
-      setTls(!!h.tls_enabled);
-      await loadPending();
-    } catch(e){
-      $("result").textContent = JSON.stringify({ok:false,error:String(e)},null,2);
-    }
-  }
+      async function provisionThisNode(){
+        const authority = document.getElementById("authorityUrl").value.trim();
+        const token = document.getElementById("bootstrapToken").value.trim();
+        if (!authority) return alert("Enter Authority URL");
+        if (!token) return alert("Enter Bootstrap token");
 
-  async function createToken(){
-    const out = await mgmtPost("/mgmt/security/bootstrap/token/create");
-    if(out.token) $("token").value = out.token;
-    $("result").textContent = JSON.stringify(out,null,2);
-  }
+        const st = await fetch("/api/v1/cluster/status",{cache:"no-store"}).then(r=>r.json());
+        const nodeId = st.node_id;
+        if (!nodeId) return alert("Local node_id not found");
 
-  async function pullInstall(){
-    const base = ($("remoteUrl").value||"").trim().replace(/\/+$/,"");
-    const token = ($("token").value||"").trim();
-    if(!base||!token){ $("result").textContent = JSON.stringify({ok:false,error:"remoteUrl + token required"},null,2); return; }
+        const bundle = await authorityIssueBundle(authority, nodeId, token);
+        const installed = await apiCall("POST", "/mgmt/security/local/install-bundle", bundle);
 
-    const st = await apiGet("/api/v1/cluster/status");
-    const nodeId = st.node_id;
+        document.getElementById("provisionOut").textContent =
+          "Provision OK ✅\n\nNext: click 'Restart service'.\n\n" +
+          JSON.stringify({ node_id: nodeId, bundle_meta: bundle.meta, installed }, null, 2);
+      }
 
-    const r = await fetch(base+"/mgmt/security/bootstrap/issue",{
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({node_id:nodeId, token})
-    });
-    const txt = await r.text();
-    let bundle=null;
-    try{ bundle=JSON.parse(txt);}catch{ bundle={raw:txt,status:r.status}; }
-    if(!r.ok){ $("result").textContent = JSON.stringify({ok:false,step:"remote issue failed",bundle},null,2); return; }
+      async function restartService(){
+        try{
+          const res = await apiCall("POST", "/mgmt/system/restart");
+          document.getElementById("provisionOut").textContent = "Restart requested.\n" + JSON.stringify(res, null, 2);
+        }catch(e){
+          alert("Restart failed: " + e.message);
+        }
+      }
 
-    const out = await mgmtPost("/mgmt/security/local/install-bundle", bundle);
-    $("result").textContent = JSON.stringify({ok:true,installed:out,meta:bundle.meta},null,2);
-  }
+      function pendingRow(key, item){
+        const div = document.createElement("div");
+        div.className = "pending";
 
-  async function restartService(){
-    const out = await mgmtPost("/mgmt/system/restart");
-    $("result").textContent = JSON.stringify(out,null,2);
-  }
+        const nodeId = String(item.node_id || "");
+        const peer = String(item.peer || "");
 
-  async function loadPending(){
-    const data = await mgmtGet("/mgmt/security/nodes/pending");
-    const pending = data.pending || {};
-    const keys = Object.keys(pending);
+        div.innerHTML = `
+          <div class="row" style="justify-content:space-between;">
+            <div><b>Pending</b> <span class="mono">${escapeHtml(key)}</span></div>
+            ${pillHtml("PENDING","warn")}
+          </div>
 
-    const body = $("pendingBody");
-    body.innerHTML = "";
+          <div class="grid2" style="margin-top:10px;">
+            <div>
+              <div class="muted2">node_id</div>
+              <div class="mono">${escapeHtml(nodeId || "(unknown)")}</div>
+            </div>
+            <div>
+              <div class="muted2">peer</div>
+              <div class="mono">${escapeHtml(peer || "(unknown)")}</div>
+            </div>
+          </div>
 
-    if(!keys.length){
-      body.insertAdjacentHTML("beforeend", `<tr><td colspan="5" class="mono">No pending nodes</td></tr>`);
-      return;
-    }
+          <div class="row" style="margin-top:10px;">
+            <input class="approveId" placeholder="approve as node_id" value="${escapeHtml(nodeId)}" />
+            <button class="btn-primary approveBtn">Approve</button>
+            <button class="btn-ghost denyBtn">Deny</button>
+          </div>
 
-    for(const k of keys){
-      const p = pending[k] || {};
-      const nodeId = p.node_id || "-";
-      body.insertAdjacentHTML("beforeend", `
-        <tr>
-          <td class="mono">${k}</td>
-          <td class="mono">${nodeId}</td>
-          <td class="mono">${p.peer || "-"}</td>
-          <td class="mono">${fmtTs(p.last_seen)}</td>
-          <td class="row">
-            <button class="primary" onclick="approve('${nodeId}','${k}')">Approve</button>
-            <button class="danger" onclick="deny('${k}')">Deny</button>
-          </td>
-        </tr>
-      `);
-    }
-  }
+          <details style="margin-top:10px;">
+            <summary class="muted">Details</summary>
+            <pre class="mono">${escapeHtml(JSON.stringify(item, null, 2))}</pre>
+          </details>
+        `;
 
-  async function approve(nodeId, pendingKey){
-    const out = await mgmtPost("/mgmt/security/nodes/approve", {node_id:nodeId, pending_key:pendingKey});
-    $("result").textContent = JSON.stringify(out,null,2);
-    await loadPending();
-  }
-  async function deny(pendingKey){
-    const out = await mgmtPost("/mgmt/security/nodes/deny", {pending_key:pendingKey, reason:"denied_in_ui"});
-    $("result").textContent = JSON.stringify(out,null,2);
-    await loadPending();
-  }
+        div.querySelector(".approveBtn").onclick = async ()=>{
+          const approveId = div.querySelector(".approveId").value.trim();
+          if (!approveId) return alert("Enter approve node_id");
+          await apiCall("POST", "/mgmt/security/nodes/approve?node_id=" + encodeURIComponent(approveId) + "&pending_key=" + encodeURIComponent(key));
+          await loadPending();
+          await loadSecurityState();
+          alert("Approved");
+        };
 
-  refreshAll();
-  setInterval(loadPending, 3000);
-</script>
-</body>
+        div.querySelector(".denyBtn").onclick = async ()=>{
+          await apiCall("POST", "/mgmt/security/nodes/deny?pending_key=" + encodeURIComponent(key));
+          await loadPending();
+          alert("Denied");
+        };
+
+        return div;
+      }
+
+      async function loadPending(){
+        const res = await apiCall("GET", "/mgmt/security/nodes/pending");
+        const pending = res.pending || {};
+        const box = document.getElementById("pendingList");
+        box.innerHTML = "";
+
+        const keys = Object.keys(pending);
+        if (!keys.length){
+          box.innerHTML = `<div class="muted">No pending nodes.</div>
+            <div class="muted2" style="margin-top:6px;">
+              If joining fails, check <a href="/events">Events</a> for <span class="mono">SECURITY_AUTH_FAILED</span>.
+            </div>`;
+          return;
+        }
+        keys.forEach(k => box.appendChild(pendingRow(k, pending[k])));
+      }
+
+      async function loadSecurityState(){
+        const res = await apiCall("GET", "/mgmt/security/state");
+        document.getElementById("state").textContent = JSON.stringify(res, null, 2);
+      }
+
+      async function blockNode(){
+        const nodeId = document.getElementById("blockNodeId").value.trim();
+        const reason = document.getElementById("blockReason").value.trim() || "revoked";
+        if (!nodeId) return alert("Enter node_id");
+        const res = await apiCall("POST", "/mgmt/security/nodes/block?node_id=" + encodeURIComponent(nodeId) + "&reason=" + encodeURIComponent(reason));
+        document.getElementById("blockOut").textContent = JSON.stringify(res, null, 2);
+        await loadSecurityState();
+      }
+
+      refreshStatus();
+      loadPending();
+      loadSecurityState();
+    </script>
+  </body>
 </html>

@@ -1,46 +1,70 @@
-let _basicAuthHeader = null;
+// apps/web/static/app.js
 
-function escapeHtml(str) {
-  return (str || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+function escapeHtml(s){
+  return String(s ?? "").replace(/[&<>"']/g, (m) => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+  }[m]));
 }
 
-async function apiCall(method, url, body = null) {
-  const headers = { "Content-Type": "application/json" };
-  headers["Authorization"] = ensureAuth();
-
-  const opts = { method, headers };
-  if (body !== null) opts.body = JSON.stringify(body);
-
+async function apiCall(method, url, body){
+  const opts = { method, headers: { "Content-Type": "application/json" } };
+  if (body !== undefined) opts.body = JSON.stringify(body);
   const res = await fetch(url, opts);
-
-  if (res.status === 401) {
-    _basicAuthHeader = null;
-    alert("Unauthorized. Please try again.");
-    throw new Error("Unauthorized");
-  }
-
   const text = await res.text();
-  try { return JSON.parse(text); } catch { return { raw: text, status: res.status }; }
+  let json = null;
+  try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
+  if (!res.ok) {
+    const msg = (json && (json.detail || json.error)) ? (json.detail || json.error) : (text || res.statusText);
+    throw new Error(msg);
+  }
+  return json;
 }
 
-async function authorityIssueBundle(authorityBaseUrl, nodeId, token) {
-  const url = authorityBaseUrl.replace(/\/+$/, "") + "/mgmt/security/bootstrap/issue";
+function setActiveNav(){
+  const path = location.pathname;
+  document.querySelectorAll(".nav a").forEach(a=>{
+    const href = a.getAttribute("href");
+    if (!href) return;
+    if (href === path) a.classList.add("active");
+    else a.classList.remove("active");
+  });
+}
+
+function pillHtml(text, kind){
+  // kind: ok | warn | bad
+  const cls = kind ? `pill ${kind}` : "pill";
+  return `<span class="${cls}"><span class="dot"></span>${escapeHtml(text)}</span>`;
+}
+
+function toFixedMaybe(v, digits=6){
+  if (typeof v === "number") return v.toFixed(digits);
+  if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v).toFixed(digits);
+  return v ?? "";
+}
+
+function copyTextFromEl(id){
+  const t = (document.getElementById(id)?.textContent || "").trim();
+  if (!t) return alert("Nothing to copy");
+  navigator.clipboard.writeText(t);
+  alert("Copied");
+}
+
+// Authority bundle helper (used by security.html)
+async function authorityIssueBundle(authorityUrl, nodeId, token){
+  const url = authorityUrl.replace(/\/+$/,"") + "/mgmt/security/bootstrap/issue";
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type":"application/json" },
     body: JSON.stringify({ node_id: nodeId, token })
   });
   const text = await res.text();
-  let obj;
-  try { obj = JSON.parse(text); } catch { obj = { raw: text, status: res.status }; }
-
+  let json = null;
+  try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
   if (!res.ok) {
-    throw new Error(obj.detail || obj.reason || ("Authority error: " + res.status));
+    const msg = (json && (json.detail || json.error)) ? (json.detail || json.error) : (text || res.statusText);
+    throw new Error(msg);
   }
-  return obj;
+  return json;
 }
+
+window.addEventListener("DOMContentLoaded", () => setActiveNav());

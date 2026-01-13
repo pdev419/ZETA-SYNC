@@ -1,137 +1,173 @@
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8" />
-  <title>Nodes - ZETA-SYNC</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    :root{--bg:#0b1220;--card:#0f172a;--border:#1f2937;--text:#e5e7eb;--muted:#94a3b8;
-      --green:#22c55e;--amber:#fbbf24;--red:#ef4444;--mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;}
-    *{box-sizing:border-box}
-    body{margin:0;font-family:ui-sans-serif,system-ui;background:var(--bg);color:var(--text)}
-    header{position:sticky;top:0;background:rgba(15,23,42,.9);backdrop-filter: blur(8px);
-      border-bottom:1px solid var(--border); padding:14px 18px; display:flex; align-items:center; gap:14px;}
-    nav a{color:var(--muted); text-decoration:none; margin-right:10px; font-size:14px}
-    nav a:hover{color:var(--text)}
-    .wrap{max-width:1100px;margin:0 auto;padding:18px}
-    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
-    .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-    .title{font-weight:800}
-    .sub{font-size:12px;color:var(--muted)}
-    button{border:0;border-radius:12px;padding:8px 10px;color:white;cursor:pointer;background:#334155;font-weight:700}
-    .right{margin-left:auto}
-    .pill{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid var(--border);font-size:12px}
-    .dot{width:8px;height:8px;border-radius:999px;background:var(--amber)}
-    .dot.ok{background:var(--green)} .dot.warn{background:var(--amber)} .dot.bad{background:var(--red)}
-    table{width:100%;border-collapse:collapse;margin-top:10px}
-    th,td{padding:10px 8px;border-bottom:1px solid var(--border);vertical-align:top}
-    th{font-size:12px;color:var(--muted);font-weight:700}
-    td{font-size:13px}
-    .mono{font-family:var(--mono)}
-    .state{font-weight:800}
-  </style>
-</head>
-<body>
-<header>
-  <div style="font-weight:800;">ZETA-SYNC</div>
-  <nav>
-    <a href="/">Home</a>
-    <a href="/nodes">Nodes</a>
-    <a href="/events">Events</a>
-    <a href="/security">Security</a>
-  </nav>
-  <div class="right row">
-    <span class="pill" id="healthPill"><span class="dot"></span><span>Loading...</span></span>
-    <button onclick="refreshAll()">Refresh</button>
-  </div>
-</header>
+  <head>
+    <meta charset="utf-8" />
+    <title>ZETA-SYNC Nodes</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Nodes</h1>
 
-<div class="wrap">
-  <div class="card">
-    <div class="row" style="justify-content:space-between;">
-      <div>
-        <div class="title">Nodes</div>
-        <div class="sub">Only identified nodes (no null node_id)</div>
+      <div class="nav">
+        <a href="/">Home</a>
+        <a href="/nodes">Nodes</a>
+        <a href="/events">Events</a>
+        <a href="/security">Security</a>
       </div>
-      <div class="sub" id="summary">-</div>
+
+      <div id="topStatus" class="row"></div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>Cluster</h2>
+            <div class="muted">Membership view.</div>
+          </div>
+          <div class="row">
+            <button class="smallbtn" onclick="refresh()">Refresh</button>
+            <label class="row muted" style="gap:8px;">
+              <input id="auto" type="checkbox" style="min-height:auto;" />
+              Auto (2s)
+            </label>
+          </div>
+        </div>
+
+        <div class="grid3">
+          <div class="kpi">
+            <div class="label">Health</div>
+            <div id="kHealth" class="value">—</div>
+          </div>
+          <div class="kpi">
+            <div class="label">Quorum</div>
+            <div id="kQuorum" class="value">—</div>
+          </div>
+          <div class="kpi">
+            <div class="label">Excluded</div>
+            <div id="kExcluded" class="value">—</div>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div id="nodesTable"></div>
+
+        <div class="divider"></div>
+        <h3>Raw</h3>
+        <pre id="rawOut">loading…</pre>
+      </div>
     </div>
 
-    <table>
-      <thead>
-        <tr>
-          <th>node_id</th>
-          <th>peer_addr</th>
-          <th>state</th>
-          <th>online</th>
-          <th>excluded</th>
-          <th>z</th>
-          <th>stability</th>
-          <th>ppm</th>
-          <th>seq</th>
-        </tr>
-      </thead>
-      <tbody id="tbody"></tbody>
-    </table>
-  </div>
-</div>
+    <script src="/static/app.js"></script>
+    <script>
+      let timer = null;
 
-<script>
-  const $ = (id) => document.getElementById(id);
+      function healthPill(h){
+        const s = String(h||"").toUpperCase();
+        if (s === "HEALTHY") return pillHtml("HEALTHY","ok");
+        if (s === "DEGRADED") return pillHtml("DEGRADED","warn");
+        if (s === "OFFLINE") return pillHtml("OFFLINE","bad");
+        return pillHtml(s || "RECOVERING","warn");
+      }
 
-  async function apiGet(url){
-    const r = await fetch(url,{cache:"no-store"});
-    if(!r.ok) throw new Error(url+" -> "+r.status);
-    return await r.json();
-  }
-  function setHealth(health){
-    const pill = $("healthPill");
-    const dot = pill.querySelector(".dot");
-    const txt = pill.querySelector("span:last-child");
-    const h = String(health||"UNKNOWN").toUpperCase();
-    txt.textContent = h;
-    dot.className = "dot";
-    if(h==="HEALTHY") dot.classList.add("ok");
-    else if(h==="DEGRADED") dot.classList.add("warn");
-    else if(h==="OFFLINE") dot.classList.add("bad");
-    else dot.classList.add("warn");
-  }
-  function fmt(x,d=6){ return (typeof x==="number") ? x.toFixed(d) : (x ?? "-"); }
+      function statePill(n){
+        const s = String(n.state || "").toUpperCase();
+        if (n.excluded) return pillHtml(`${s || "EXCLUDED"}${n.reason ? " • " + n.reason : ""}`,"bad");
+        if (s === "ACTIVE") return pillHtml("ACTIVE","ok");
+        if (s === "JOINING" || s === "DISCOVERING") return pillHtml(s,"warn");
+        if (s === "OFFLINE") return pillHtml("OFFLINE","bad");
+        return pillHtml(s || "—","warn");
+      }
 
-  async function refreshAll(){
-    let ch=null;
-    try { ch = await apiGet("/api/v1/cluster/health"); }
-    catch { ch = await apiGet("/api/v1/cluster/status"); }
-    setHealth(ch.cluster_health);
-    $("summary").textContent = `quorum ${ch.quorum || "-"} • active ${ch.active_nodes ?? "-"} / ${ch.expected_nodes ?? "-"}`;
+      function relTime(ts){
+        if (!ts) return "—";
+        const sec = Math.max(0, Math.floor(Date.now()/1000 - Number(ts)));
+        if (sec < 5) return "now";
+        if (sec < 60) return `${sec}s ago`;
+        const m = Math.floor(sec/60);
+        if (m < 60) return `${m}m ago`;
+        const h = Math.floor(m/60);
+        return `${h}h ago`;
+      }
 
-    const data = await apiGet("/api/v1/nodes");
-    const nodes = (data.nodes || []).filter(n => n && n.node_id); // remove null node_id
-    const tb = $("tbody");
-    tb.innerHTML = "";
+      async function topStatus(){
+        const box = document.getElementById("topStatus");
+        try{
+          const st = await fetch("/api/v1/cluster/status",{cache:"no-store"}).then(r=>r.json());
+          const h = await fetch("/api/v1/health",{cache:"no-store"}).then(r=>r.json());
+          box.innerHTML =
+            pillHtml(h.tls_enabled ? "TLS enabled" : "TLS disabled", h.tls_enabled ? "ok" : "warn") +
+            ` ${pillHtml(st.node_id || "node", "warn")}` +
+            ` ${pillHtml(st.advertise_addr || "advertise", "warn")}`;
+        }catch(e){
+          box.innerHTML = pillHtml("status error", "bad");
+        }
+      }
 
-    for(const n of nodes){
-      const m = n.metrics || {};
-      const state = n.state || n.membership_state || n.membership?.state || n.status || "-";
-      const online = (n.online === false) ? "false" : "true";
-      const reason = n.reason || n.exclude_reason || n.membership?.reason || "";
-      tb.insertAdjacentHTML("beforeend", `
-        <tr>
-          <td class="mono">${n.node_id}</td>
-          <td class="mono">${n.peer_addr || "-"}</td>
-          <td><span class="state">${String(state).toUpperCase()}</span></td>
-          <td>${online}</td>
-          <td>${n.excluded ? ("true" + (reason?` (${reason})`:"")) : "false"}</td>
-          <td class="mono">${fmt(m.z,8)}</td>
-          <td class="mono">${fmt(m.stability,6)}</td>
-          <td class="mono">${fmt(m.ppm_offset,6)}</td>
-          <td class="mono">${m.sequence ?? "-"}</td>
-        </tr>
-      `);
-    }
-  }
+      function render(nodes){
+        const rows = (nodes || []).filter(n => n.node_id);
 
-  refreshAll();
-  setInterval(refreshAll, 2000);
-</script>
-</body>
+        let html = `
+          <table>
+            <thead>
+              <tr>
+                <th>node_id</th>
+                <th>peer_addr</th>
+                <th>state</th>
+                <th>last_seen</th>
+                <th>z</th>
+                <th>drift</th>
+                <th>stability</th>
+                <th>ppm_offset</th>
+              </tr>
+            </thead>
+            <tbody>
+        `;
+
+        rows.forEach(n=>{
+          const m = n.metrics || {};
+          html += `
+            <tr>
+              <td class="mono">${escapeHtml(n.node_id)}</td>
+              <td class="mono">${escapeHtml(n.peer_addr || "")}</td>
+              <td>${statePill(n)}</td>
+              <td class="mono">${escapeHtml(relTime(n.last_seen))}</td>
+              <td class="mono">${escapeHtml(toFixedMaybe(m.z, 8))}</td>
+              <td class="mono">${escapeHtml(toFixedMaybe(m.drift, 6))}</td>
+              <td class="mono">${escapeHtml(toFixedMaybe(m.stability, 6))}</td>
+              <td class="mono">${escapeHtml(toFixedMaybe(m.ppm_offset, 6))}</td>
+            </tr>
+          `;
+        });
+
+        html += `</tbody></table>`;
+        document.getElementById("nodesTable").innerHTML = html;
+      }
+
+      async function refresh(){
+        await topStatus();
+        const res = await fetch("/api/v1/nodes",{cache:"no-store"}).then(r=>r.json());
+        const cluster = res.cluster || {};
+
+        document.getElementById("kHealth").innerHTML = healthPill(cluster.cluster_health);
+        document.getElementById("kQuorum").textContent = cluster.quorum || "—";
+        document.getElementById("kExcluded").textContent = (cluster.excluded_nodes || []).length;
+
+        render(res.nodes || []);
+        document.getElementById("rawOut").textContent = JSON.stringify(res, null, 2);
+      }
+
+      document.getElementById("auto").addEventListener("change",(e)=>{
+        if (e.target.checked){
+          refresh();
+          timer = setInterval(refresh, 2000);
+        } else {
+          if (timer) clearInterval(timer);
+          timer = null;
+        }
+      });
+
+      refresh();
+    </script>
+  </body>
 </html>
