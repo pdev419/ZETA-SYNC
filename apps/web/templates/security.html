@@ -55,11 +55,6 @@
       <div class="title">Admin Login</div>
       <div class="sub">Used for management actions</div>
       <div style="height:10px;"></div>
-      <div class="grid">
-        <div style="grid-column: span 6;"><input id="adminUser" placeholder="ADMIN_USER" /></div>
-        <div style="grid-column: span 6;"><input id="adminPass" placeholder="ADMIN_PASS" type="password" /></div>
-      </div>
-      <div style="height:10px;"></div>
       <div class="row">
         <button class="secondary" onclick="refreshAll()">Refresh</button>
         <button class="primary" onclick="createToken()">Create Token</button>
@@ -164,11 +159,9 @@
     const token = ($("token").value||"").trim();
     if(!base||!token){ $("result").textContent = JSON.stringify({ok:false,error:"remoteUrl + token required"},null,2); return; }
 
-    // local node_id
     const st = await apiGet("/api/v1/cluster/status");
     const nodeId = st.node_id;
 
-    // pull from remote (no auth on remote issue endpoint)
     const r = await fetch(base+"/mgmt/security/bootstrap/issue",{
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({node_id:nodeId, token})
@@ -178,7 +171,6 @@
     try{ bundle=JSON.parse(txt);}catch{ bundle={raw:txt,status:r.status}; }
     if(!r.ok){ $("result").textContent = JSON.stringify({ok:false,step:"remote issue failed",bundle},null,2); return; }
 
-    // install locally (admin)
     const out = await mgmtPost("/mgmt/security/local/install-bundle", bundle);
     $("result").textContent = JSON.stringify({ok:true,installed:out,meta:bundle.meta},null,2);
   }
