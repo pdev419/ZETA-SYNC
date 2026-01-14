@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import socket
 import time
@@ -66,11 +67,6 @@ def parse_csv_seeds(raw: str) -> List[str]:
     return [p for p in parts if p and ":" in p]
 
 
-def split_hostport(addr: str) -> Tuple[str, int]:
-    host, port = parse_hostport(addr)
-    return host, int(port)
-
-
 def detect_lan_ip() -> Optional[str]:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -103,6 +99,16 @@ def _cn_from_peer_cert(peer_cert: dict | None) -> Optional[str]:
     except Exception:
         return None
     return None
+
+
+def _sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+def _ca_fingerprint_sha256_pem(pem: str) -> str:
+    # stable UI fingerprint
+    b = pem.encode("utf-8")
+    return hashlib.sha256(b).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -149,6 +155,9 @@ class NodeRuntime:
     local_seq: int = 0
     zeta_proc: Optional[ZetaSyncProcess] = None
 
+    # NEW: event throttle memory (in-process)
+    _event_throttle: Dict[str, float] = field(default_factory=dict)
+
     def advertise_addr(self) -> str:
         return self.self_advertise_addr
 
@@ -159,16 +168,30 @@ class NodeRuntime:
     def log_event(self, event_type: str, severity: str = "INFO", **extra: Any) -> None:
         if not has_min_disk_free(LOG_DIR):
             return
+
+        seq = self.next_seq()
+        eid = _sha1(f"{self.node_id}:{seq}")
+
         append_jsonl(
             EVENTS_LOG,
             {
+                "ts": time.time(),
+                "event_id": eid,
                 "node_id": self.node_id,
-                "sequence_id": self.next_seq(),
+                "sequence_id": seq,
                 "event_type": event_type,
                 "severity": severity,
                 **extra,
             },
         )
+
+    def log_event_throttled(self, throttle_key: str, min_interval_sec: float, event_type: str, severity: str = "INFO", **extra: Any) -> None:
+        now = time.time()
+        last = self._event_throttle.get(throttle_key, 0.0)
+        if now - last < min_interval_sec:
+            return
+        self._event_throttle[throttle_key] = now
+        self.log_event(event_type, severity=severity, **extra)
 
     def _resolve_cmd_workdir(self) -> tuple[str, str]:
         cmd0 = self.settings.zeta_sync_cmd
@@ -218,44 +241,6 @@ class NodeRuntime:
             return
         self.metrics_by_node[node_id] = metrics
 
-    def nodes_view(self, include_unknown: bool = False, membership: Optional[MembershipTracker] = None) -> Dict[str, Any]:
-        nodes: List[Dict[str, Any]] = []
-
-        nodes.append(
-            {
-                "node_id": self.node_id,
-                "peer_addr": self.advertise_addr(),
-                "metrics": self.metrics_by_node.get(self.node_id, {}),
-                "excluded": self.node_id in self.excluded_nodes,
-                **(membership.node_payload(self.node_id) if membership else {}),
-            }
-        )
-
-        seen: Set[str] = {self.node_id}
-        for peer_addr in sorted(self.discovery.known_peers):
-            nid = self.peer_addr_to_node_id.get(peer_addr)
-            if nid:
-                if nid in seen:
-                    continue
-                seen.add(nid)
-                nodes.append(
-                    {
-                        "node_id": nid,
-                        "peer_addr": peer_addr,
-                        "metrics": self.metrics_by_node.get(nid, {}),
-                        "excluded": nid in self.excluded_nodes,
-                        **(membership.node_payload(nid) if membership else {}),
-                    }
-                )
-            else:
-                if include_unknown:
-                    nodes.append({"node_id": None, "peer_addr": peer_addr, "metrics": {}, "excluded": False, "state": "UNKNOWN"})
-
-        out: Dict[str, Any] = {"nodes": nodes}
-        if membership:
-            out["cluster"] = membership.cluster_payload()
-        return out
-
     def cluster_status(self) -> Dict[str, Any]:
         return {
             "node_id": self.node_id,
@@ -273,14 +258,24 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
 
     peer_cert = meta.get("peer_cert") if isinstance(meta, dict) else None
     peer_node_id = _cn_from_peer_cert(peer_cert) if tls_enabled else None
+    source_peer = str(meta.get("peer_id") or "")
 
     if tls_enabled:
         if not peer_node_id:
-            ctx.log_event("SECURITY_AUTH_FAILED", severity="ERROR", reason="no_peer_cert", peer=meta.get("peer_id"))
+            # rate-limit spam
+            window = float(os.getenv("SECURITY_AUTH_FAIL_THROTTLE_SEC", "5"))
+            ctx.log_event_throttled(
+                throttle_key=f"SECURITY_AUTH_FAILED:no_peer_cert:{source_peer}",
+                min_interval_sec=window,
+                event_type="SECURITY_AUTH_FAILED",
+                severity="ERROR",
+                reason="no_peer_cert",
+                source_peer=source_peer,
+            )
             return {"type": "ERROR", "reason": "mTLS_required"}
 
         if store.is_blocked(peer_node_id):
-            ctx.log_event("SECURITY_AUTH_FAILED", severity="ERROR", reason="blocklisted", node_id=peer_node_id)
+            ctx.log_event("SECURITY_AUTH_FAILED", severity="ERROR", reason="blocklisted", source_node_id=peer_node_id, source_peer=source_peer)
             return {"type": "ERROR", "reason": "blocklisted"}
 
         if require_allow and (not store.is_allowed(peer_node_id)):
@@ -293,18 +288,19 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
                     pending_key,
                     {
                         "node_id": peer_node_id,
-                        "peer": meta.get("peer_id"),
+                        "peer": source_peer,
                         "peer_cert_subject": peer_cert.get("subject") if isinstance(peer_cert, dict) else None,
                         "first_seen": rec.pending.get(pending_key, {}).get("first_seen", now),
                         "last_seen": now,
                     },
                 )
-                ctx.log_event("NODE_JOIN_REQUESTED", reason_code="not_allowlisted", node_id=peer_node_id)
+                ctx.log_event("NODE_JOIN_REQUESTED", severity="WARNING", reason_code="not_allowlisted", source_node_id=peer_node_id, source_peer=source_peer)
 
             return {"type": "ERROR", "reason": "pending_approval"}
 
+    # membership observation
     if peer_node_id:
-        app.state.membership.observe(peer_node_id, peer_addr=str(meta.get("peer_id") or ""))
+        app.state.membership.observe(peer_node_id, peer_addr=source_peer)
 
     if t == "PING":
         return {"type": "PONG", "from": ctx.node_id}
@@ -332,7 +328,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
         sender = peer_node_id if tls_enabled else msg.get("sender")
         if isinstance(sender, str) and isinstance(metrics, dict):
             ctx.upsert_peer_metrics(sender, metrics)
-            app.state.membership.observe(sender, peer_addr=str(meta.get("peer_id") or ""), metrics=metrics)
+            app.state.membership.observe(sender, peer_addr=source_peer, metrics=metrics)
         return {"type": "METRICS_ACK"}
 
     return {"type": "ERROR", "reason": f"Unknown type {t}"}
@@ -346,7 +342,6 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
         for seed in list(ctx.settings.seeds):
             try:
                 host, port = parse_hostport(seed)
-
                 resp = await send_message(host, port, {"type": "PEER_LIST_REQ"}, ssl_ctx=app.state.client_ssl_ctx)
                 peers = resp.get("peers", [])
                 if isinstance(peers, list):
@@ -388,11 +383,10 @@ async def metrics_loop(ctx: NodeRuntime, app: FastAPI) -> None:
             parsed = parse_metrics_line(line)
             if parsed:
                 ctx.upsert_peer_metrics(ctx.node_id, parsed)
-
                 app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics=parsed)
 
                 if has_min_disk_free(LOG_DIR):
-                    append_jsonl(METRICS_LOG, {"node_id": ctx.node_id, "sequence_id": ctx.next_seq(), "metrics": parsed})
+                    append_jsonl(METRICS_LOG, {"ts": time.time(), "node_id": ctx.node_id, "sequence_id": ctx.next_seq(), "metrics": parsed})
 
         await asyncio.sleep(0.2)
 
@@ -443,23 +437,11 @@ async def membership_loop(ctx: NodeRuntime, app: FastAPI) -> None:
             ctx.excluded_nodes.discard(nid)
             ctx.log_event("NODE_REINCLUDED", severity="WARNING", node_id=nid, reason_code="healthy_again")
 
-        health = app.state.membership.cluster_health()
+        health = app.state.membership.export_cluster().get("cluster_health")
         if last_health is None:
             last_health = health
         elif health != last_health:
-            if health == "DEGRADED":
-                ctx.log_event(
-                    "CLUSTER_DEGRADED",
-                    severity="WARNING",
-                    excluded_nodes=app.state.membership.excluded_nodes(),
-                    reason_code="exclusion_or_quorum",
-                )
-            elif health == "HEALTHY":
-                ctx.log_event("CLUSTER_HEALTHY", severity="INFO")
-            elif health == "OFFLINE":
-                ctx.log_event("CLUSTER_OFFLINE", severity="ERROR")
-            else:
-                ctx.log_event("CLUSTER_RECOVERING", severity="INFO")
+            ctx.log_event("CLUSTER_HEALTH_CHANGED", severity="INFO", from_health=last_health, to_health=health)
             last_health = health
 
         await asyncio.sleep(tick_sec)
@@ -496,6 +478,7 @@ def create_app() -> FastAPI:
     )
     app.state.ctx = ctx
 
+    # membership settings + health gating settings
     app.state.membership = MembershipTracker(
         expected_cluster_size=int(os.getenv("EXPECTED_CLUSTER_SIZE", "3")),
         offline_after_sec=float(os.getenv("OFFLINE_AFTER_SEC", "10")),
@@ -503,12 +486,16 @@ def create_app() -> FastAPI:
         outlier_consecutive=int(os.getenv("OUTLIER_CONSECUTIVE_SAMPLES", "5")),
         recover_stability_threshold=float(os.getenv("RECOVER_STABILITY_THRESHOLD", "0.995")),
         recover_consecutive=int(os.getenv("RECOVER_CONSECUTIVE_SAMPLES", "10")),
+        healthy_stability_threshold=float(os.getenv("HEALTHY_STABILITY_THRESHOLD", "0.995")),
+        healthy_consecutive=int(os.getenv("HEALTHY_CONSECUTIVE_TICKS", "10")),
     )
     app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={})
 
+    # security store
     store = SecurityStore(SECURITY_JSON)
     app.state.security_store = store
 
+    # TLS flags
     app.state.tls_enabled = os.getenv("TLS_ENABLED", "0").strip() == "1"
     app.state.tls_require_allow = os.getenv("TLS_REQUIRE_ALLOWLIST", "1").strip() == "1"
     app.state.tls_join_throttle = float(os.getenv("TLS_JOIN_THROTTLE_SEC", "5"))
@@ -563,6 +550,7 @@ def create_app() -> FastAPI:
 
     app.router.lifespan_context = lifespan
 
+    # ---------- UI ----------
     @app.get("/", response_class=HTMLResponse)
     async def ui_index(request: Request):
         return templates.TemplateResponse("index.html", {"request": request})
@@ -579,6 +567,7 @@ def create_app() -> FastAPI:
     async def ui_security(request: Request):
         return templates.TemplateResponse("security.html", {"request": request})
 
+    # ---------- Mgmt ----------
     @app.post("/mgmt/cluster/start")
     async def mgmt_start():
         try:
@@ -594,11 +583,10 @@ def create_app() -> FastAPI:
 
     @app.post("/mgmt/security/ca/init")
     async def mgmt_ca_init():
-        ca_days = int(os.getenv("TLS_CA_VALIDITY_DAYS", "3650"))
-        ensure_cluster_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path), validity_days=ca_days)
+        ca_days_ = int(os.getenv("TLS_CA_VALIDITY_DAYS", "3650"))
+        ensure_cluster_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path), validity_days=ca_days_)
 
         created_self_identity = False
-
         if not (app.state.node_cert_path.exists() and app.state.node_key_path.exists()):
             ca_key, ca_cert = load_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path))
             node_key_pem, node_cert_pem = issue_node_cert(
@@ -615,42 +603,13 @@ def create_app() -> FastAPI:
             created_self_identity = True
             app.state.ctx.log_event("TLS_SELF_IDENTITY_ISSUED", severity="WARNING", node_id=app.state.ctx.node_id)
 
-        return {
-            "ok": True,
-            "ca_cert_path": str(app.state.ca_cert_path),
-            "node_cert_path": str(app.state.node_cert_path),
-            "node_key_path": str(app.state.node_key_path),
-            "created_self_identity": created_self_identity,
-            "next_step": "Click 'Restart service' so TLS contexts load.",
-        }
+        return {"ok": True, "created_self_identity": created_self_identity}
 
     @app.get("/mgmt/security/ca/cert")
     async def mgmt_ca_cert():
         if not app.state.ca_cert_path.exists():
             raise HTTPException(status_code=404, detail="CA cert missing, init first")
         return {"ca_cert_pem": app.state.ca_cert_path.read_text(encoding="utf-8")}
-
-    @app.post("/mgmt/security/nodes/issue")
-    async def mgmt_issue_node_cert(node_id: str):
-        ca_key, ca_cert = load_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path))
-        node_key_pem, node_cert_pem = issue_node_cert(
-            ca_key, ca_cert, node_id=node_id, validity_days=app.state.node_validity_days
-        )
-        return {
-            "node_id": node_id,
-            "ca_cert_pem": app.state.ca_cert_path.read_text(encoding="utf-8"),
-            "node_cert_pem": node_cert_pem.decode("utf-8"),
-            "node_key_pem": node_key_pem.decode("utf-8"),
-        }
-
-    @app.post("/mgmt/security/nodes/sign-csr")
-    async def mgmt_sign_csr(csr_pem: str):
-        ca_key, ca_cert = load_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path))
-        cert_pem = sign_csr(ca_key, ca_cert, csr_pem.encode("utf-8"), validity_days=app.state.node_validity_days)
-        return {
-            "cert_pem": cert_pem.decode("utf-8"),
-            "ca_cert_pem": app.state.ca_cert_path.read_text(encoding="utf-8"),
-        }
 
     @app.get("/mgmt/security/nodes/pending")
     async def mgmt_pending():
@@ -683,12 +642,7 @@ def create_app() -> FastAPI:
     @app.get("/mgmt/security/state")
     async def mgmt_security_state():
         rec = app.state.security_store.load()
-        return {
-            "allowlist": rec.allowlist,
-            "blocklist": rec.blocklist,
-            "pending": rec.pending,
-            "bootstrap": rec.bootstrap,
-        }
+        return {"allowlist": rec.allowlist, "blocklist": rec.blocklist, "pending": rec.pending, "bootstrap": rec.bootstrap}
 
     @app.post("/mgmt/security/bootstrap/token/create")
     async def mgmt_bootstrap_token_create():
@@ -700,27 +654,19 @@ def create_app() -> FastAPI:
     async def mgmt_bootstrap_issue(payload: Dict[str, Any]):
         node_id_req = str(payload.get("node_id") or "").strip()
         token = str(payload.get("token") or "").strip()
-
         if not node_id_req:
             raise HTTPException(status_code=400, detail="node_id required")
         if not token:
             raise HTTPException(status_code=400, detail="token required")
 
         if not app.state.security_store.verify_bootstrap_token(token):
-            app.state.ctx.log_event(
-                "BOOTSTRAP_ISSUE_DENIED", severity="ERROR", node_id=node_id_req, reason="bad_token"
-            )
+            app.state.ctx.log_event("BOOTSTRAP_ISSUE_DENIED", severity="ERROR", node_id=node_id_req, reason="bad_token")
             raise HTTPException(status_code=403, detail="invalid bootstrap token")
 
-        ensure_cluster_ca(
-            CAPaths(app.state.ca_key_path, app.state.ca_cert_path),
-            validity_days=int(os.getenv("TLS_CA_VALIDITY_DAYS", "3650")),
-        )
+        ensure_cluster_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path), validity_days=int(os.getenv("TLS_CA_VALIDITY_DAYS", "3650")))
 
         ca_key, ca_cert = load_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path))
-        node_key_pem, node_cert_pem = issue_node_cert(
-            ca_key, ca_cert, node_id=node_id_req, validity_days=app.state.node_validity_days
-        )
+        node_key_pem, node_cert_pem = issue_node_cert(ca_key, ca_cert, node_id=node_id_req, validity_days=app.state.node_validity_days)
 
         app.state.ctx.log_event("BOOTSTRAP_ISSUED", severity="WARNING", node_id=node_id_req)
 
@@ -728,11 +674,7 @@ def create_app() -> FastAPI:
             "ca_cert_pem": app.state.ca_cert_path.read_text(encoding="utf-8"),
             "node_cert_pem": node_cert_pem.decode("utf-8"),
             "node_key_pem": node_key_pem.decode("utf-8"),
-            "meta": {
-                "issued_for": node_id_req,
-                "validity_days": app.state.node_validity_days,
-                "install_to": "data/state/tls/",
-            },
+            "meta": {"issued_for": node_id_req, "validity_days": app.state.node_validity_days, "install_to": "data/state/tls/"},
         }
 
     @app.post("/mgmt/security/local/install-bundle")
@@ -754,14 +696,7 @@ def create_app() -> FastAPI:
         atomic_write(app.state.node_key_path, node_key_pem)
 
         app.state.ctx.log_event("TLS_BUNDLE_INSTALLED", severity="WARNING", path=str(TLS_DIR))
-        return {
-            "ok": True,
-            "written": [
-                str(app.state.ca_cert_path),
-                str(app.state.node_cert_path),
-                str(app.state.node_key_path),
-            ],
-        }
+        return {"ok": True}
 
     @app.post("/mgmt/system/restart")
     async def mgmt_system_restart(background: BackgroundTasks):
@@ -774,6 +709,7 @@ def create_app() -> FastAPI:
         background.add_task(do_exit)
         return {"ok": True, "message": "Exiting now; PM2 should restart it automatically."}
 
+    # ---------- APIs ----------
     @app.get("/api/v1/health")
     async def api_health():
         return {"ok": True, "tls_enabled": bool(app.state.tls_enabled)}
@@ -781,24 +717,54 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/cluster/status")
     async def api_cluster_status():
         base = app.state.ctx.cluster_status()
-        base["cluster"] = app.state.membership.cluster_payload()
+        base["cluster"] = app.state.membership.export_cluster()
         return base
 
     @app.get("/api/v1/cluster/health")
     async def api_cluster_health():
-        return app.state.membership.cluster_payload()
-
-    @app.get("/api/v1/cluster/reference")
-    async def api_cluster_reference():
-        return app.state.membership.reference_payload()
+        return app.state.membership.export_cluster()
 
     @app.get("/api/v1/nodes")
     async def api_nodes(include_unknown: bool = Query(False)):
-        return app.state.ctx.nodes_view(include_unknown=include_unknown, membership=app.state.membership)
+        # UI now reads membership.export_nodes for consistent state display
+        nodes = app.state.membership.export_nodes()
+        if include_unknown:
+            # legacy: show discovery-only peers without node_id if needed
+            known = set([m.get("peer_addr") for m in nodes if m.get("peer_addr")])
+            for p in sorted(app.state.ctx.discovery.known_peers):
+                if p not in known:
+                    nodes.append({"node_id": None, "peer_addr": p, "state": "UNKNOWN", "online": False, "excluded": False, "reason": None, "metrics": {}})
+        return {"nodes": nodes, "cluster": app.state.membership.export_cluster()}
 
     @app.get("/api/v1/cluster/events")
-    async def api_events():
-        return {"events": tail_jsonl(EVENTS_LOG, limit=200)}
+    async def api_events(limit: int = 200):
+        ev = tail_jsonl(EVENTS_LOG, limit=min(max(1, limit), 1000))
+        # Sort by timestamp desc for UI sanity
+        ev_sorted = sorted(ev, key=lambda x: float(x.get("ts", 0)), reverse=True)
+        return {"events": ev_sorted}
+
+    @app.get("/api/v1/security/ca/status")
+    async def api_ca_status():
+        ca_initialized = app.state.ca_cert_path.exists() and app.state.ca_key_path.exists()
+        ca_pem = app.state.ca_cert_path.read_text(encoding="utf-8") if app.state.ca_cert_path.exists() else ""
+        fp = _ca_fingerprint_sha256_pem(ca_pem) if ca_pem else None
+        return {
+            "tls_enabled": bool(app.state.tls_enabled),
+            "ca_initialized": bool(ca_initialized),
+            "is_authority": bool(ca_initialized),
+            "ca_fingerprint_sha256": fp,
+        }
+
+    @app.get("/api/v1/cluster/criteria")
+    async def api_criteria():
+        c = app.state.membership.export_cluster()
+        return {
+            "expected_nodes": c["expected_nodes"],
+            "quorum_needed": c["quorum_needed"],
+            "healthy_stability_threshold": c["healthy_stability_threshold"],
+            "healthy_required": c["healthy_required"],
+            "rule": "HEALTHY when quorum met + no exclusions + stability >= threshold for N consecutive ticks",
+        }
 
     return app
 
