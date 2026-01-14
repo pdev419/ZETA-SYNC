@@ -106,7 +106,6 @@ def _sha1(s: str) -> str:
 
 
 def _ca_fingerprint_sha256_pem(pem: str) -> str:
-    # stable UI fingerprint
     b = pem.encode("utf-8")
     return hashlib.sha256(b).hexdigest()
 
@@ -155,7 +154,6 @@ class NodeRuntime:
     local_seq: int = 0
     zeta_proc: Optional[ZetaSyncProcess] = None
 
-    # NEW: event throttle memory (in-process)
     _event_throttle: Dict[str, float] = field(default_factory=dict)
 
     def advertise_addr(self) -> str:
@@ -262,7 +260,6 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
 
     if tls_enabled:
         if not peer_node_id:
-            # rate-limit spam
             window = float(os.getenv("SECURITY_AUTH_FAIL_THROTTLE_SEC", "5"))
             ctx.log_event_throttled(
                 throttle_key=f"SECURITY_AUTH_FAILED:no_peer_cert:{source_peer}",
@@ -298,7 +295,6 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
 
             return {"type": "ERROR", "reason": "pending_approval"}
 
-    # membership observation
     if peer_node_id:
         app.state.membership.observe(peer_node_id, peer_addr=source_peer)
 
@@ -478,7 +474,6 @@ def create_app() -> FastAPI:
     )
     app.state.ctx = ctx
 
-    # membership settings + health gating settings
     app.state.membership = MembershipTracker(
         expected_cluster_size=int(os.getenv("EXPECTED_CLUSTER_SIZE", "3")),
         offline_after_sec=float(os.getenv("OFFLINE_AFTER_SEC", "10")),
@@ -491,15 +486,12 @@ def create_app() -> FastAPI:
     )
     app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={})
 
-    # security store
     store = SecurityStore(SECURITY_JSON)
     app.state.security_store = store
 
-    # TLS flags
     app.state.tls_enabled = os.getenv("TLS_ENABLED", "0").strip() == "1"
     app.state.tls_require_allow = os.getenv("TLS_REQUIRE_ALLOWLIST", "1").strip() == "1"
     app.state.tls_join_throttle = float(os.getenv("TLS_JOIN_THROTTLE_SEC", "5"))
-    ca_days = int(os.getenv("TLS_CA_VALIDITY_DAYS", "3650"))
     node_days = int(os.getenv("TLS_NODE_VALIDITY_DAYS", "365"))
     app.state.node_validity_days = node_days
 
@@ -507,9 +499,6 @@ def create_app() -> FastAPI:
     app.state.ca_cert_path = CA_CERT
     app.state.node_key_path = NODE_KEY
     app.state.node_cert_path = NODE_CERT
-
-    if app.state.tls_enabled:
-        ensure_cluster_ca(CAPaths(CA_KEY, CA_CERT), validity_days=ca_days)
 
     app.state.server_ssl_ctx = None
     app.state.client_ssl_ctx = None
@@ -550,7 +539,6 @@ def create_app() -> FastAPI:
 
     app.router.lifespan_context = lifespan
 
-    # ---------- UI ----------
     @app.get("/", response_class=HTMLResponse)
     async def ui_index(request: Request):
         return templates.TemplateResponse("index.html", {"request": request})
@@ -567,7 +555,6 @@ def create_app() -> FastAPI:
     async def ui_security(request: Request):
         return templates.TemplateResponse("security.html", {"request": request})
 
-    # ---------- Mgmt ----------
     @app.post("/mgmt/cluster/start")
     async def mgmt_start():
         try:
@@ -709,7 +696,6 @@ def create_app() -> FastAPI:
         background.add_task(do_exit)
         return {"ok": True, "message": "Exiting now; PM2 should restart it automatically."}
 
-    # ---------- APIs ----------
     @app.get("/api/v1/health")
     async def api_health():
         return {"ok": True, "tls_enabled": bool(app.state.tls_enabled)}
@@ -726,10 +712,8 @@ def create_app() -> FastAPI:
 
     @app.get("/api/v1/nodes")
     async def api_nodes(include_unknown: bool = Query(False)):
-        # UI now reads membership.export_nodes for consistent state display
         nodes = app.state.membership.export_nodes()
         if include_unknown:
-            # legacy: show discovery-only peers without node_id if needed
             known = set([m.get("peer_addr") for m in nodes if m.get("peer_addr")])
             for p in sorted(app.state.ctx.discovery.known_peers):
                 if p not in known:
@@ -739,7 +723,6 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/cluster/events")
     async def api_events(limit: int = 200):
         ev = tail_jsonl(EVENTS_LOG, limit=min(max(1, limit), 1000))
-        # Sort by timestamp desc for UI sanity
         ev_sorted = sorted(ev, key=lambda x: float(x.get("ts", 0)), reverse=True)
         return {"events": ev_sorted}
 
