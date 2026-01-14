@@ -15,9 +15,9 @@ class MemberInfo:
     online: bool = True
 
     excluded: bool = False
-    exclude_reason: Optional[str] = None
+    exclude_reason: Optional[str] = None  # "UNREACHABLE" | "OUTLIER"
 
-    state: str = "DISCOVERING"
+    state: str = "DISCOVERING"  # DISCOVERING | JOINING | ACTIVE | DEGRADED | RECOVERING | OFFLINE
 
     outlier_streak: int = 0
     recover_streak: int = 0
@@ -27,21 +27,34 @@ class MemberInfo:
 
 @dataclass
 class ClusterDerived:
-    cluster_health: str = "RECOVERING"
+    cluster_health: str = "RECOVERING"  # HEALTHY | DEGRADED | RECOVERING | OFFLINE
     quorum: str = "0/0"
     active_nodes: int = 0
     expected_nodes: int = 3
+    quorum_needed: int = 2
 
     excluded_nodes: list[str] = field(default_factory=list)
     exclude_reasons: Dict[str, str] = field(default_factory=dict)
 
     reference_z: Optional[float] = None
-    reference_method: Optional[str] = None
+    reference_method: Optional[str] = None  # median3 | mean2 | single
+
+    # NEW avoid “RECOVERING while everything is fine”
+    healthy_streak: int = 0
+    healthy_required: int = 10
+    healthy_stability_threshold: float = 0.995
 
     last_update: float = field(default_factory=lambda: time.time())
 
 
 class MembershipTracker:
+    """
+    M4 Improved:
+    - Clear HEALTHY rule:
+        quorum met + no exclusions + stability >= threshold for N consecutive ticks
+    - Expected nodes stays fixed (EXPECTED_CLUSTER_SIZE), not auto-derived from members
+    """
+
     def __init__(
         self,
         expected_cluster_size: int = 3,
@@ -50,8 +63,10 @@ class MembershipTracker:
         outlier_consecutive: int = 5,
         recover_stability_threshold: float = 0.995,
         recover_consecutive: int = 10,
+        healthy_stability_threshold: float = 0.995,
+        healthy_consecutive: int = 10,
     ):
-        self.expected_cluster_size = expected_cluster_size
+        self.expected_cluster_size = max(1, int(expected_cluster_size))
         self.offline_after_sec = offline_after_sec
         self.outlier_z_abs_threshold = outlier_z_abs_threshold
         self.outlier_consecutive = outlier_consecutive
@@ -59,37 +74,32 @@ class MembershipTracker:
         self.recover_consecutive = recover_consecutive
 
         self.members: Dict[str, MemberInfo] = {}
-        self.cluster = ClusterDerived(expected_nodes=expected_cluster_size)
+        self.cluster = ClusterDerived(
+            expected_nodes=self.expected_cluster_size,
+            healthy_required=int(healthy_consecutive),
+            healthy_stability_threshold=float(healthy_stability_threshold),
+        )
 
     def ensure_member(self, node_id: str, peer_addr: Optional[str] = None) -> MemberInfo:
         m = self.members.get(node_id)
         if not m:
-            m = MemberInfo(node_id=node_id, peer_addr=None, state="DISCOVERING")
+            m = MemberInfo(node_id=node_id, peer_addr=peer_addr, state="DISCOVERING")
             self.members[node_id] = m
-
         if peer_addr:
-            peer_addr = str(peer_addr).strip()
-            if peer_addr and peer_addr != "0.0.0.0:0":
-                m.peer_addr = peer_addr
-
+            m.peer_addr = peer_addr
         return m
 
     def observe(self, node_id: str, peer_addr: Optional[str], metrics: Optional[Dict[str, Any]] = None) -> MemberInfo:
         m = self.ensure_member(node_id, peer_addr)
         m.last_seen = time.time()
-
         m.online = True
-
         if metrics and isinstance(metrics, dict):
             m.metrics = metrics
 
-        if not m.online:
-            m.state = "OFFLINE"
-        elif m.excluded:
+        if m.excluded:
             m.state = "RECOVERING"
         else:
             m.state = "ACTIVE" if (m.metrics and len(m.metrics) > 0) else "JOINING"
-
         return m
 
     def tick(self) -> Dict[str, Any]:
@@ -99,6 +109,7 @@ class MembershipTracker:
         excluded: list[tuple[str, str]] = []
         reincluded: list[str] = []
 
+        # offline detection + unreachable exclusion
         for node_id, m in self.members.items():
             was_online = m.online
             if now - m.last_seen > self.offline_after_sec:
@@ -106,7 +117,6 @@ class MembershipTracker:
                 m.state = "OFFLINE"
                 if was_online:
                     became_offline.append(node_id)
-
                 if not m.excluded:
                     m.excluded = True
                     m.exclude_reason = "UNREACHABLE"
@@ -115,10 +125,10 @@ class MembershipTracker:
                 m.online = True
                 if not was_online:
                     became_online.append(node_id)
-
                 if m.excluded and m.exclude_reason == "UNREACHABLE":
                     m.state = "RECOVERING"
 
+        # outlier + recovery
         for node_id, m in self.members.items():
             if not m.online:
                 continue
@@ -152,7 +162,6 @@ class MembershipTracker:
                     reincluded.append(node_id)
 
         self._derive()
-
         return {
             "became_offline": became_offline,
             "became_online": became_online,
@@ -161,9 +170,10 @@ class MembershipTracker:
         }
 
     def _derive(self) -> None:
-        expected = max(self.expected_cluster_size, len(self.members), 1)
-        self.cluster.expected_nodes = expected
+        expected = self.expected_cluster_size
         quorum_needed = (expected // 2) + 1
+        self.cluster.expected_nodes = expected
+        self.cluster.quorum_needed = quorum_needed
 
         active_members = [m for m in self.members.values() if m.online and not m.excluded]
         active = len(active_members)
@@ -177,15 +187,8 @@ class MembershipTracker:
             m.node_id: (m.exclude_reason or "UNKNOWN") for m in self.members.values() if m.excluded
         }
 
-        if active == 0:
-            self.cluster.cluster_health = "OFFLINE"
-        else:
-            if expected >= 3 and active >= quorum_needed and len(excluded_nodes) == 0:
-                self.cluster.cluster_health = "HEALTHY"
-            else:
-                self.cluster.cluster_health = "DEGRADED" if expected >= 3 else "RECOVERING"
-
-        zs: list[float] = []
+        # Reference z calculation
+        zs = []
         for m in active_members:
             z = m.metrics.get("z")
             if isinstance(z, (int, float)):
@@ -205,47 +208,49 @@ class MembershipTracker:
             self.cluster.reference_z = None
             self.cluster.reference_method = None
 
+        # Clear HEALTHY rule
+        has_quorum = active >= quorum_needed
+        has_exclusions = len(excluded_nodes) > 0
+
+        # derive “cluster stability”: median of member stabilities (best-effort)
+        stabs = []
+        for m in active_members:
+            s = m.metrics.get("stability")
+            if isinstance(s, (int, float)):
+                stabs.append(float(s))
+        stabs.sort()
+        cluster_stab = stabs[len(stabs) // 2] if stabs else None
+
+        healthy_now = (
+            has_quorum
+            and (not has_exclusions)
+            and (cluster_stab is not None)
+            and (cluster_stab >= self.cluster.healthy_stability_threshold)
+        )
+
+        if active == 0:
+            self.cluster.cluster_health = "OFFLINE"
+            self.cluster.healthy_streak = 0
+        else:
+            if healthy_now:
+                self.cluster.healthy_streak += 1
+            else:
+                self.cluster.healthy_streak = 0
+
+            if self.cluster.healthy_streak >= self.cluster.healthy_required:
+                self.cluster.cluster_health = "HEALTHY"
+            else:
+                # not healthy yet -> either DEGRADED or RECOVERING
+                # If expected >=3 but not enough nodes, always DEGRADED (client expectation)
+                if expected >= 3 and active < expected:
+                    self.cluster.cluster_health = "DEGRADED"
+                else:
+                    # two-node clusters can become healthy, but until stable streak completes -> RECOVERING
+                    self.cluster.cluster_health = "RECOVERING" if (not has_exclusions) else "DEGRADED"
+
         self.cluster.last_update = time.time()
 
-    def node_payload(self, node_id: str) -> Dict[str, Any]:
-        m = self.members.get(node_id)
-        if not m:
-            return {"state": "UNKNOWN", "online": False, "last_seen": None, "reason": None}
-        return {
-            "state": m.state,
-            "online": m.online,
-            "last_seen": m.last_seen,
-            "reason": m.exclude_reason,
-        }
-
-    def cluster_payload(self) -> Dict[str, Any]:
-        c = self.cluster
-        return {
-            "cluster_health": c.cluster_health,
-            "quorum": c.quorum,
-            "active_nodes": c.active_nodes,
-            "expected_nodes": c.expected_nodes,
-            "excluded_nodes": c.excluded_nodes,
-            "exclude_reasons": c.exclude_reasons,
-            "reference_z": c.reference_z,
-            "reference_method": c.reference_method,
-            "last_update": c.last_update,
-        }
-
-    def reference_payload(self) -> Dict[str, Any]:
-        c = self.cluster
-        return {
-            "reference_z": c.reference_z,
-            "reference_method": c.reference_method,
-            "last_update": c.last_update,
-        }
-
-    def cluster_health(self) -> str:
-        return self.cluster.cluster_health
-
-    def excluded_nodes(self) -> list[str]:
-        return list(self.cluster.excluded_nodes)
-
+    # --- Payload helpers used by main.py UI/API ---
     def export_nodes(self) -> list[dict]:
         out = []
         for m in self.members.values():
@@ -265,4 +270,19 @@ class MembershipTracker:
         return out
 
     def export_cluster(self) -> dict:
-        return self.cluster_payload()
+        c = self.cluster
+        return {
+            "cluster_health": c.cluster_health,
+            "quorum": c.quorum,
+            "quorum_needed": c.quorum_needed,
+            "active_nodes": c.active_nodes,
+            "expected_nodes": c.expected_nodes,
+            "excluded_nodes": c.excluded_nodes,
+            "exclude_reasons": c.exclude_reasons,
+            "reference_z": c.reference_z,
+            "reference_method": c.reference_method,
+            "healthy_streak": c.healthy_streak,
+            "healthy_required": c.healthy_required,
+            "healthy_stability_threshold": c.healthy_stability_threshold,
+            "last_update": c.last_update,
+        }

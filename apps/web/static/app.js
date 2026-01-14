@@ -1,55 +1,36 @@
-// apps/web/static/app.js
-
-function escapeHtml(s){
-  return String(s ?? "").replace(/[&<>"']/g, (m) => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
-  }[m]));
+async function apiCall(method, url, body) {
+  const opt = { method, headers: { "Content-Type": "application/json" } };
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const res = await fetch(url, opt);
+  const txt = await res.text();
+  let data;
+  try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+  if (!res.ok) throw new Error((data && data.detail) ? data.detail : ("HTTP " + res.status));
+  return data;
 }
 
-async function apiCall(method, url, body){
-  const opts = { method, headers: { "Content-Type": "application/json" } };
-  if (body !== undefined) opts.body = JSON.stringify(body);
-  const res = await fetch(url, opts);
-  const text = await res.text();
-  let json = null;
-  try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
-  if (!res.ok) {
-    const msg = (json && (json.detail || json.error)) ? (json.detail || json.error) : (text || res.statusText);
-    throw new Error(msg);
-  }
-  return json;
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
-function setActiveNav(){
-  const path = location.pathname;
-  document.querySelectorAll(".nav a").forEach(a=>{
-    const href = a.getAttribute("href");
-    if (!href) return;
-    if (href === path) a.classList.add("active");
-    else a.classList.remove("active");
-  });
+function setBadge(id, status){
+  const el = document.getElementById(id);
+  if(!el) return;
+  el.textContent = status;
+
+  const s = String(status||"").toLowerCase();
+  el.className = "badge";
+  if (s.includes("healthy")) el.classList.add("pill","healthy");
+  else if (s.includes("degraded")) el.classList.add("pill","degraded");
+  else if (s.includes("recover")) el.classList.add("pill","recovering");
+  else if (s.includes("offline")) el.classList.add("pill","offline");
 }
 
-function pillHtml(text, kind){
-  // kind: ok | warn | bad
-  const cls = kind ? `pill ${kind}` : "pill";
-  return `<span class="${cls}"><span class="dot"></span>${escapeHtml(text)}</span>`;
-}
-
-function toFixedMaybe(v, digits=6){
-  if (typeof v === "number") return v.toFixed(digits);
-  if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v).toFixed(digits);
-  return v ?? "";
-}
-
-function copyTextFromEl(id){
-  const t = (document.getElementById(id)?.textContent || "").trim();
-  if (!t) return alert("Nothing to copy");
-  navigator.clipboard.writeText(t);
-  alert("Copied");
-}
-
-// Authority bundle helper (used by security.html)
 async function authorityIssueBundle(authorityUrl, nodeId, token){
   const url = authorityUrl.replace(/\/+$/,"") + "/mgmt/security/bootstrap/issue";
   const res = await fetch(url, {
@@ -57,14 +38,7 @@ async function authorityIssueBundle(authorityUrl, nodeId, token){
     headers: { "Content-Type":"application/json" },
     body: JSON.stringify({ node_id: nodeId, token })
   });
-  const text = await res.text();
-  let json = null;
-  try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
-  if (!res.ok) {
-    const msg = (json && (json.detail || json.error)) ? (json.detail || json.error) : (text || res.statusText);
-    throw new Error(msg);
-  }
-  return json;
+  const data = await res.json();
+  if(!res.ok) throw new Error(data.detail || "Authority issue failed");
+  return data;
 }
-
-window.addEventListener("DOMContentLoaded", () => setActiveNav());

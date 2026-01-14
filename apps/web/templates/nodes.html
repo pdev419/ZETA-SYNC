@@ -7,167 +7,85 @@
   </head>
   <body>
     <div class="wrap">
-      <h1>Nodes</h1>
-
-      <div class="nav">
-        <a href="/">Home</a>
-        <a href="/nodes">Nodes</a>
-        <a href="/events">Events</a>
-        <a href="/security">Security</a>
-      </div>
-
-      <div id="topStatus" class="row"></div>
+      <header class="top">
+        <div>
+          <div class="brand">ZETA-SYNC</div>
+          <div class="sub">Nodes</div>
+        </div>
+        <nav class="nav">
+          <a href="/">Home</a>
+          <a class="active" href="/nodes">Nodes</a>
+          <a href="/events">Events</a>
+          <a href="/security">Security</a>
+        </nav>
+      </header>
 
       <div class="card">
-        <div class="card-head">
+        <div class="row spread">
           <div>
-            <h2>Cluster</h2>
-            <div class="muted">Membership view.</div>
+            <h2 style="margin:0">Cluster</h2>
+            <div class="muted" id="clusterLine">…</div>
           </div>
-          <div class="row">
-            <button class="smallbtn" onclick="refresh()">Refresh</button>
-            <label class="row muted" style="gap:8px;">
-              <input id="auto" type="checkbox" style="min-height:auto;" />
-              Auto (2s)
-            </label>
-          </div>
+          <button class="btn" onclick="loadNodes()">Refresh</button>
         </div>
 
-        <div class="grid3">
-          <div class="kpi">
-            <div class="label">Health</div>
-            <div id="kHealth" class="value">—</div>
-          </div>
-          <div class="kpi">
-            <div class="label">Quorum</div>
-            <div id="kQuorum" class="value">—</div>
-          </div>
-          <div class="kpi">
-            <div class="label">Excluded</div>
-            <div id="kExcluded" class="value">—</div>
-          </div>
-        </div>
+        <div id="nodesGrid" class="nodes"></div>
 
-        <div class="divider"></div>
-
-        <div id="nodesTable"></div>
-
-        <div class="divider"></div>
-        <h3>Raw</h3>
-        <pre id="rawOut">loading…</pre>
+        <details class="adv">
+          <summary>Advanced / Debug</summary>
+          <pre id="rawNodes"></pre>
+        </details>
       </div>
     </div>
 
     <script src="/static/app.js"></script>
     <script>
-      let timer = null;
+      function metric(v){ return (v===null || v===undefined) ? "-" : String(v); }
 
-      function healthPill(h){
-        const s = String(h||"").toUpperCase();
-        if (s === "HEALTHY") return pillHtml("HEALTHY","ok");
-        if (s === "DEGRADED") return pillHtml("DEGRADED","warn");
-        if (s === "OFFLINE") return pillHtml("OFFLINE","bad");
-        return pillHtml(s || "RECOVERING","warn");
-      }
+      function nodeCard(n){
+        const m = n.metrics || {};
+        const st = n.state || "UNKNOWN";
+        const excluded = !!n.excluded;
 
-      function statePill(n){
-        const s = String(n.state || "").toUpperCase();
-        if (n.excluded) return pillHtml(`${s || "EXCLUDED"}${n.reason ? " • " + n.reason : ""}`,"bad");
-        if (s === "ACTIVE") return pillHtml("ACTIVE","ok");
-        if (s === "JOINING" || s === "DISCOVERING") return pillHtml(s,"warn");
-        if (s === "OFFLINE") return pillHtml("OFFLINE","bad");
-        return pillHtml(s || "—","warn");
-      }
+        return `
+          <div class="node ${excluded ? "excluded":""}">
+            <div class="row spread">
+              <div>
+                <div class="nodeId">${escapeHtml(n.node_id || "UNKNOWN")}</div>
+                <div class="muted">${escapeHtml(n.peer_addr || "-")}</div>
+              </div>
+              <div class="pill ${st.toLowerCase()}">${escapeHtml(st)}</div>
+            </div>
 
-      function relTime(ts){
-        if (!ts) return "—";
-        const sec = Math.max(0, Math.floor(Date.now()/1000 - Number(ts)));
-        if (sec < 5) return "now";
-        if (sec < 60) return `${sec}s ago`;
-        const m = Math.floor(sec/60);
-        if (m < 60) return `${m}m ago`;
-        const h = Math.floor(m/60);
-        return `${h}h ago`;
-      }
+            <div class="kpi">
+              <div><span>z</span><b>${metric(m.z)}</b></div>
+              <div><span>drift</span><b>${metric(m.drift)}</b></div>
+              <div><span>stability</span><b>${metric(m.stability)}</b></div>
+              <div><span>ppm</span><b>${metric(m.ppm_offset)}</b></div>
+            </div>
 
-      async function topStatus(){
-        const box = document.getElementById("topStatus");
-        try{
-          const st = await fetch("/api/v1/cluster/status",{cache:"no-store"}).then(r=>r.json());
-          const h = await fetch("/api/v1/health",{cache:"no-store"}).then(r=>r.json());
-          box.innerHTML =
-            pillHtml(h.tls_enabled ? "TLS enabled" : "TLS disabled", h.tls_enabled ? "ok" : "warn") +
-            ` ${pillHtml(st.node_id || "node", "warn")}` +
-            ` ${pillHtml(st.advertise_addr || "advertise", "warn")}`;
-        }catch(e){
-          box.innerHTML = pillHtml("status error", "bad");
-        }
-      }
-
-      function render(nodes){
-        const rows = (nodes || []).filter(n => n.node_id);
-
-        let html = `
-          <table>
-            <thead>
-              <tr>
-                <th>node_id</th>
-                <th>peer_addr</th>
-                <th>state</th>
-                <th>last_seen</th>
-                <th>z</th>
-                <th>drift</th>
-                <th>stability</th>
-                <th>ppm_offset</th>
-              </tr>
-            </thead>
-            <tbody>
+            ${excluded ? `<div class="warnBox">Excluded: ${escapeHtml(n.reason || "UNKNOWN")}</div>` : ``}
+          </div>
         `;
-
-        rows.forEach(n=>{
-          const m = n.metrics || {};
-          html += `
-            <tr>
-              <td class="mono">${escapeHtml(n.node_id)}</td>
-              <td class="mono">${escapeHtml(n.peer_addr || "")}</td>
-              <td>${statePill(n)}</td>
-              <td class="mono">${escapeHtml(relTime(n.last_seen))}</td>
-              <td class="mono">${escapeHtml(toFixedMaybe(m.z, 8))}</td>
-              <td class="mono">${escapeHtml(toFixedMaybe(m.drift, 6))}</td>
-              <td class="mono">${escapeHtml(toFixedMaybe(m.stability, 6))}</td>
-              <td class="mono">${escapeHtml(toFixedMaybe(m.ppm_offset, 6))}</td>
-            </tr>
-          `;
-        });
-
-        html += `</tbody></table>`;
-        document.getElementById("nodesTable").innerHTML = html;
       }
 
-      async function refresh(){
-        await topStatus();
-        const res = await fetch("/api/v1/nodes",{cache:"no-store"}).then(r=>r.json());
-        const cluster = res.cluster || {};
+      async function loadNodes(){
+        const res = await fetch("/api/v1/nodes").then(r=>r.json());
+        const c = res.cluster || {};
+        setBadgeLine(c);
 
-        document.getElementById("kHealth").innerHTML = healthPill(cluster.cluster_health);
-        document.getElementById("kQuorum").textContent = cluster.quorum || "—";
-        document.getElementById("kExcluded").textContent = (cluster.excluded_nodes || []).length;
-
-        render(res.nodes || []);
-        document.getElementById("rawOut").textContent = JSON.stringify(res, null, 2);
+        const nodes = res.nodes || [];
+        document.getElementById("nodesGrid").innerHTML = nodes.map(nodeCard).join("");
+        document.getElementById("rawNodes").textContent = JSON.stringify(res, null, 2);
       }
 
-      document.getElementById("auto").addEventListener("change",(e)=>{
-        if (e.target.checked){
-          refresh();
-          timer = setInterval(refresh, 2000);
-        } else {
-          if (timer) clearInterval(timer);
-          timer = null;
-        }
-      });
+      function setBadgeLine(c){
+        const line = `Health: ${c.cluster_health || "-"} · Active/Expected: ${c.active_nodes ?? "-"} / ${c.expected_nodes ?? "-"} · Quorum: ${c.quorum || "-"} (need ${c.quorum_needed ?? "-"})`;
+        document.getElementById("clusterLine").textContent = line;
+      }
 
-      refresh();
+      loadNodes();
+      setInterval(loadNodes, 2000);
     </script>
   </body>
 </html>

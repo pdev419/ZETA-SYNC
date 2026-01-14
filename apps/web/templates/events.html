@@ -7,105 +7,82 @@
   </head>
   <body>
     <div class="wrap">
-      <h1>Events</h1>
-
-      <div class="nav">
-        <a href="/">Home</a>
-        <a href="/nodes">Nodes</a>
-        <a href="/events">Events</a>
-        <a href="/security">Security</a>
-      </div>
-
-      <div id="topStatus" class="row"></div>
+      <header class="top">
+        <div>
+          <div class="brand">ZETA-SYNC</div>
+          <div class="sub">Events</div>
+        </div>
+        <nav class="nav">
+          <a href="/">Home</a>
+          <a href="/nodes">Nodes</a>
+          <a class="active" href="/events">Events</a>
+          <a href="/security">Security</a>
+        </nav>
+      </header>
 
       <div class="card">
-        <div class="card-head">
+        <div class="row spread">
           <div>
-            <h2>Event log</h2>
-            <div class="muted">Filter quickly. Great for join/auth debugging.</div>
+            <h2 style="margin:0">Event stream</h2>
+            <div class="muted">Sorted by timestamp. sequence_id is per-node.</div>
           </div>
-          <div class="row">
-            <input id="q" placeholder="filter text (e.g. AUTH_FAILED, JOIN, OUTLIER)" style="min-width:340px;" />
-            <button class="smallbtn" onclick="refresh()">Refresh</button>
-            <button class="smallbtn btn-ghost" onclick="copyTextFromEl('rawOut')">Copy JSON</button>
-          </div>
+          <button class="btn" onclick="loadEvents()">Refresh</button>
         </div>
 
-        <div id="list"></div>
+        <div id="events"></div>
 
-        <div class="divider"></div>
-        <h3>Raw</h3>
-        <pre id="rawOut">loading…</pre>
+        <details class="adv">
+          <summary>Advanced / Debug</summary>
+          <pre id="rawEvents"></pre>
+        </details>
       </div>
     </div>
 
     <script src="/static/app.js"></script>
     <script>
-      async function topStatus(){
-        const box = document.getElementById("topStatus");
-        try{
-          const st = await fetch("/api/v1/cluster/status",{cache:"no-store"}).then(r=>r.json());
-          const h = await fetch("/api/v1/health",{cache:"no-store"}).then(r=>r.json());
-          box.innerHTML =
-            pillHtml(h.tls_enabled ? "TLS enabled" : "TLS disabled", h.tls_enabled ? "ok" : "warn") +
-            ` ${pillHtml(st.node_id || "node", "warn")}` +
-            ` ${pillHtml(st.advertise_addr || "advertise", "warn")}`;
-        }catch(e){
-          box.innerHTML = pillHtml("status error", "bad");
-        }
+      function fmtTs(ts){
+        if(!ts) return "-";
+        const d = new Date(ts*1000);
+        return d.toLocaleString();
       }
 
-      function sevPill(sev){
-        const s = String(sev || "").toUpperCase();
-        if (s === "ERROR") return pillHtml("ERROR","bad");
-        if (s === "WARNING" || s === "WARN") return pillHtml("WARN","warn");
-        return pillHtml("INFO","ok");
+      function row(e){
+        const id = (e.event_id || "").slice(0,10);
+        const sev = (e.severity || "INFO").toLowerCase();
+        return `
+          <div class="event">
+            <div class="row spread">
+              <div class="mono small">${escapeHtml(fmtTs(e.ts))}</div>
+              <div class="pill ${sev}">${escapeHtml(e.severity || "INFO")}</div>
+            </div>
+            <div class="row spread">
+              <div>
+                <b>${escapeHtml(e.event_type || "-")}</b>
+                <div class="muted small">
+                  node: <span class="mono">${escapeHtml(e.node_id || "-")}</span> ·
+                  seq: <span class="mono">${escapeHtml(String(e.sequence_id ?? "-"))}</span> ·
+                  id: <span class="mono">${escapeHtml(id)}</span>
+                </div>
+              </div>
+            </div>
+
+            <details class="adv">
+              <summary>Details</summary>
+              <pre>${escapeHtml(JSON.stringify(e, null, 2))}</pre>
+            </details>
+          </div>
+        `;
       }
 
-      function render(events, filter){
-        const q = (filter || "").trim().toLowerCase();
-        const items = (events || []).filter(e=>{
-          if (!q) return true;
-          const txt = JSON.stringify(e).toLowerCase();
-          return txt.includes(q);
-        }).slice(-200).reverse();
-
-        if (!items.length){
-          document.getElementById("list").innerHTML = `<div class="muted">No matching events.</div>`;
-          return;
-        }
-
-        let html = `<table><thead><tr>
-          <th>seq</th><th>type</th><th>severity</th><th>details</th>
-        </tr></thead><tbody>`;
-
-        items.forEach(ev=>{
-          html += `<tr>
-            <td class="mono">${escapeHtml(ev.sequence_id ?? "")}</td>
-            <td class="mono">${escapeHtml(ev.event_type ?? "")}</td>
-            <td>${sevPill(ev.severity)}</td>
-            <td class="mono">${escapeHtml(ev.reason || ev.reason_code || ev.peer || ev.detail || "")}</td>
-          </tr>`;
-        });
-
-        html += `</tbody></table>`;
-        document.getElementById("list").innerHTML = html;
-      }
-
-      async function refresh(){
-        await topStatus();
-        const res = await fetch("/api/v1/cluster/events",{cache:"no-store"}).then(r=>r.json());
+      async function loadEvents(){
+        const res = await fetch("/api/v1/cluster/events?limit=200").then(r=>r.json());
         const events = res.events || [];
-        const filter = document.getElementById("q").value;
-        render(events, filter);
-        document.getElementById("rawOut").textContent = JSON.stringify(events.slice(-200), null, 2);
+        document.getElementById("events").innerHTML = events.map(row).join("") || `<div class="muted">No events.</div>`;
+        document.getElementById("rawEvents").textContent = JSON.stringify(res, null, 2);
       }
 
-      document.getElementById("q").addEventListener("keydown", (e)=>{
-        if (e.key === "Enter") refresh();
-      });
-
-      refresh();
+      loadEvents();
+      setInterval(loadEvents, 2500);
     </script>
   </body>
 </html>

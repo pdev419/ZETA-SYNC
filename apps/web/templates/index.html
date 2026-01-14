@@ -2,120 +2,82 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>ZETA-SYNC Dashboard</title>
+    <title>ZETA-SYNC</title>
     <link rel="stylesheet" href="/static/app.css" />
   </head>
   <body>
     <div class="wrap">
-      <h1>ZETA-SYNC Cluster</h1>
+      <header class="top">
+        <div>
+          <div class="brand">ZETA-SYNC</div>
+          <div class="sub">Cluster dashboard</div>
+        </div>
+        <nav class="nav">
+          <a class="active" href="/">Home</a>
+          <a href="/nodes">Nodes</a>
+          <a href="/events">Events</a>
+          <a href="/security">Security</a>
+        </nav>
+      </header>
 
-      <div class="nav">
-        <a href="/">Home</a>
-        <a href="/nodes">Nodes</a>
-        <a href="/events">Events</a>
-        <a href="/security">Security</a>
-      </div>
-
-      <div id="topStatus" class="row"></div>
-
-      <div class="card">
-        <div class="card-head">
-          <div>
-            <h2>Overview</h2>
-            <div class="muted">Cluster health, quorum, reference z.</div>
+      <div class="grid2">
+        <div class="card">
+          <h2>Cluster Health</h2>
+          <div id="healthBadge" class="badge">…</div>
+          <div class="kv">
+            <div><span>Active / Expected</span><b id="activeExpected">-</b></div>
+            <div><span>Quorum</span><b id="quorum">-</b></div>
+            <div><span>Quorum Needed</span><b id="quorumNeeded">-</b></div>
+            <div><span>Reference Z</span><b id="refZ">-</b></div>
           </div>
+
+          <div class="hint" id="criteriaLine"></div>
+
+          <details class="adv">
+            <summary>Advanced / Debug</summary>
+            <pre id="rawStatus"></pre>
+          </details>
+        </div>
+
+        <div class="card">
+          <h2>Controls</h2>
+          <p class="muted">Start/Stop the local sync process. Applies to this node only.</p>
           <div class="row">
-            <button class="smallbtn" onclick="refreshAll()">Refresh</button>
-            <button class="smallbtn btn-primary" onclick="startSync()">Start Sync</button>
-            <button class="smallbtn btn-danger" onclick="stopSync()">Stop Sync</button>
+            <button class="btn primary" onclick="clusterStart()">Start sync</button>
+            <button class="btn" onclick="clusterStop()">Stop sync</button>
+            <button class="btn warn" onclick="restartService()">Restart service</button>
           </div>
-        </div>
-
-        <div class="grid3">
-          <div class="kpi">
-            <div class="label">Cluster health</div>
-            <div id="kHealth" class="value">—</div>
-          </div>
-          <div class="kpi">
-            <div class="label">Quorum</div>
-            <div id="kQuorum" class="value">—</div>
-          </div>
-          <div class="kpi">
-            <div class="label">Reference z</div>
-            <div id="kRef" class="value">—</div>
-          </div>
-        </div>
-
-        <div class="divider"></div>
-
-        <div class="grid2">
-          <div>
-            <h3>Local status</h3>
-            <pre id="localOut">loading…</pre>
-          </div>
-          <div>
-            <h3>Notes</h3>
-            <div class="muted">
-              • <b>HEALTHY</b>: quorum met, no exclusions.<br/>
-              • <b>DEGRADED</b>: exclusions or quorum risk.<br/>
-              • <b>RECOVERING</b>: early startup / small set.<br/>
-              • <b>OFFLINE</b>: no active nodes.
-            </div>
-          </div>
+          <pre id="controlOut" class="small"></pre>
         </div>
       </div>
     </div>
 
     <script src="/static/app.js"></script>
     <script>
-      function healthPill(h){
-        const s = String(h||"").toUpperCase();
-        if (s === "HEALTHY") return pillHtml("HEALTHY","ok");
-        if (s === "DEGRADED") return pillHtml("DEGRADED","warn");
-        if (s === "OFFLINE") return pillHtml("OFFLINE","bad");
-        return pillHtml(s || "RECOVERING","warn");
+      async function loadHome() {
+        const st = await fetch("/api/v1/cluster/status").then(r => r.json());
+        const criteria = await fetch("/api/v1/cluster/criteria").then(r => r.json());
+
+        const c = st.cluster || {};
+        setBadge("healthBadge", c.cluster_health || "…");
+
+        document.getElementById("activeExpected").textContent = `${c.active_nodes ?? "-"} / ${c.expected_nodes ?? "-"}`;
+        document.getElementById("quorum").textContent = c.quorum || "-";
+        document.getElementById("quorumNeeded").textContent = c.quorum_needed ?? "-";
+        document.getElementById("refZ").textContent = (c.reference_z === null || c.reference_z === undefined) ? "-" : String(c.reference_z);
+
+        document.getElementById("criteriaLine").textContent =
+          `HEALTHY when quorum met + no exclusions + stability ≥ ${criteria.healthy_stability_threshold} for ${criteria.healthy_required} ticks.`;
+
+        document.getElementById("rawStatus").textContent = JSON.stringify(st, null, 2);
       }
 
-      async function topStatus(){
-        const box = document.getElementById("topStatus");
-        try{
-          const st = await fetch("/api/v1/cluster/status",{cache:"no-store"}).then(r=>r.json());
-          const h = await fetch("/api/v1/health",{cache:"no-store"}).then(r=>r.json());
-          box.innerHTML =
-            pillHtml(h.tls_enabled ? "TLS enabled" : "TLS disabled", h.tls_enabled ? "ok" : "warn") +
-            ` ${pillHtml(st.node_id || "node", "warn")}` +
-            ` ${pillHtml(st.advertise_addr || "advertise", "warn")}`;
-        }catch(e){
-          box.innerHTML = pillHtml("status error", "bad");
-        }
-      }
+      async function clusterStart(){ document.getElementById("controlOut").textContent = JSON.stringify(await apiCall("POST","/mgmt/cluster/start"),null,2);}
+      async function clusterStop(){ document.getElementById("controlOut").textContent = JSON.stringify(await apiCall("POST","/mgmt/cluster/stop"),null,2);}
+      async function restartService(){ document.getElementById("controlOut").textContent = JSON.stringify(await apiCall("POST","/mgmt/system/restart"),null,2);}
 
-      async function refreshAll(){
-        await topStatus();
-
-        const st = await fetch("/api/v1/cluster/status",{cache:"no-store"}).then(r=>r.json());
-        const cluster = st.cluster || {};
-
-        document.getElementById("kHealth").innerHTML = healthPill(cluster.cluster_health);
-        document.getElementById("kQuorum").textContent = cluster.quorum || "—";
-
-        const refz = cluster.reference_z;
-        const refm = cluster.reference_method;
-        document.getElementById("kRef").textContent =
-          (refz === null || refz === undefined) ? "—" : `${Number(refz).toFixed(8)} (${refm || "—"})`;
-
-        document.getElementById("localOut").textContent = JSON.stringify(st, null, 2);
-      }
-      async function startSync(){
-        try{ await apiCall("POST","/mgmt/cluster/start"); alert("Sync started"); }
-        catch(e){ alert("Start failed: " + e.message); }
-      }
-      async function stopSync(){
-        try{ await apiCall("POST","/mgmt/cluster/stop"); alert("Sync stopped"); }
-        catch(e){ alert("Stop failed: " + e.message); }
-      }
-
-      refreshAll();
+      loadHome();
+      setInterval(loadHome, 2000);
     </script>
   </body>
 </html>
