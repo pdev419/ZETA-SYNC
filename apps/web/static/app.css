@@ -107,6 +107,19 @@ input:focus{ border-color:rgba(96,165,250,.55); }
 .pill.error{ background:rgba(239,68,68,.12); border-color:rgba(239,68,68,.35); }
 .pill.warning{ background:rgba(245,158,11,.12); border-color:rgba(245,158,11,.35); }
 
+.pill.active{
+  background:rgba(34,197,94,.12);
+  border-color:rgba(34,197,94,.35);
+}
+.pill.paused{
+  background:rgba(245,158,11,.12);
+  border-color:rgba(245,158,11,.35);
+}
+.pill.unknown{
+  background:rgba(148,163,184,.10);
+  border-color:rgba(148,163,184,.25);
+}
+
 .kv{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:30px; margin-bottom: 10px; }
 .kv > div{ display:flex; justify-content:space-between; border:1px solid var(--border); border-radius:12px; padding:10px; background:rgba(0,0,0,.12); }
 .kv span{ color:var(--muted); }
