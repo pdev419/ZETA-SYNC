@@ -9,7 +9,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
 import uvicorn
 from dotenv import load_dotenv
@@ -26,7 +26,7 @@ from node.constants import ENV_FILE, EVENTS_LOG, LOG_DIR, METRICS_LOG, PROJECT_R
 from node.peer.client import send_message
 from node.peer.server import PeerServer
 from node.peer.tls import TLSPaths, build_client_ssl_context, build_server_ssl_context
-from node.security.ca import CAPaths, ensure_cluster_ca, issue_node_cert, load_ca, sign_csr
+from node.security.ca import CAPaths, ensure_cluster_ca, issue_node_cert, load_ca
 from node.security.store import SecurityStore
 from node.storage.jsonl import append_jsonl, has_min_disk_free, tail_jsonl
 from node.storage.node_id import load_or_create_node_id
@@ -147,17 +147,20 @@ class NodeRuntime:
     self_advertise_addr: str
 
     metrics_by_node: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    peer_addr_to_node_id: Dict[str, str] = field(default_factory=dict)
-    node_id_to_peer_addr: Dict[str, str] = field(default_factory=dict)
-
-    excluded_nodes: Set[str] = field(default_factory=set)
-    local_seq: int = 0
     zeta_proc: Optional[ZetaSyncProcess] = None
 
+    local_seq: int = 0
     _event_throttle: Dict[str, float] = field(default_factory=dict)
 
     def advertise_addr(self) -> str:
         return self.self_advertise_addr
+
+    def cluster_status(self) -> Dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "advertise_addr": self.advertise_addr(),
+            "known_peers": sorted(self.discovery.known_peers),
+        }
 
     def next_seq(self) -> int:
         self.local_seq += 1
@@ -166,10 +169,8 @@ class NodeRuntime:
     def log_event(self, event_type: str, severity: str = "INFO", **extra: Any) -> None:
         if not has_min_disk_free(LOG_DIR):
             return
-
         seq = self.next_seq()
         eid = _sha1(f"{self.node_id}:{seq}")
-
         append_jsonl(
             EVENTS_LOG,
             {
@@ -183,7 +184,14 @@ class NodeRuntime:
             },
         )
 
-    def log_event_throttled(self, throttle_key: str, min_interval_sec: float, event_type: str, severity: str = "INFO", **extra: Any) -> None:
+    def log_event_throttled(
+        self,
+        throttle_key: str,
+        min_interval_sec: float,
+        event_type: str,
+        severity: str = "INFO",
+        **extra: Any,
+    ) -> None:
         now = time.time()
         last = self._event_throttle.get(throttle_key, 0.0)
         if now - last < min_interval_sec:
@@ -210,14 +218,10 @@ class NodeRuntime:
             await self.zeta_proc.start()
         except FileNotFoundError as e:
             self.log_event("SYNC_START_FAILED", severity="ERROR", reason="FILE_NOT_FOUND", detail=str(e))
-            raise RuntimeError(
-                f"ZETA_SYNC_CMD not found. Check .env ZETA_SYNC_CMD='{self.settings.zeta_sync_cmd}'."
-            ) from e
+            raise RuntimeError(f"ZETA_SYNC_CMD not found. Check .env ZETA_SYNC_CMD='{self.settings.zeta_sync_cmd}'.") from e
         except PermissionError as e:
             self.log_event("SYNC_START_FAILED", severity="ERROR", reason="PERMISSION_DENIED", detail=str(e))
-            raise RuntimeError(
-                f"ZETA_SYNC_CMD not executable. chmod +x '{self.settings.zeta_sync_cmd}'."
-            ) from e
+            raise RuntimeError(f"ZETA_SYNC_CMD not executable. chmod +x '{self.settings.zeta_sync_cmd}'.") from e
 
         self.log_event("SYNC_STARTED", cmd=[self.settings.zeta_sync_cmd] + self.settings.zeta_sync_args)
 
@@ -226,25 +230,47 @@ class NodeRuntime:
             await self.zeta_proc.stop()
         self.log_event("SYNC_STOPPED")
 
-    def learn_peer_identity(self, peer_addr: str, node_id: str) -> None:
-        if not peer_addr or not node_id:
-            return
-        if node_id == self.node_id:
-            return
-        self.peer_addr_to_node_id[peer_addr] = node_id
-        self.node_id_to_peer_addr[node_id] = peer_addr
+    def sync_running(self) -> bool:
+        if not self.zeta_proc:
+            return False
+        try:
+            return bool(self.zeta_proc.status().running)
+        except Exception:
+            return False
 
-    def upsert_peer_metrics(self, node_id: str, metrics: Dict[str, Any]) -> None:
-        if not node_id or not isinstance(metrics, dict):
-            return
-        self.metrics_by_node[node_id] = metrics
 
-    def cluster_status(self) -> Dict[str, Any]:
-        return {
-            "node_id": self.node_id,
-            "advertise_addr": self.advertise_addr(),
-            "known_peers": sorted(self.discovery.known_peers),
-        }
+async def broadcast_sync(app: FastAPI, action: str) -> dict:
+    msg = {"type": "SYNC_START"} if action == "start" else {"type": "SYNC_STOP"}
+    results: dict = {"local": None, "peers": []}
+
+    try:
+        if action == "start":
+            await app.state.ctx.start_sync()
+            app.state.membership.observe(
+                app.state.ctx.node_id,
+                peer_addr=app.state.ctx.advertise_addr(),
+                metrics={"sync_running": True},
+            )
+        else:
+            await app.state.ctx.stop_sync()
+            app.state.membership.observe(
+                app.state.ctx.node_id,
+                peer_addr=app.state.ctx.advertise_addr(),
+                metrics={"sync_running": False},
+            )
+        results["local"] = {"ok": True}
+    except Exception as e:
+        results["local"] = {"ok": False, "error": str(e)}
+
+    for peer in list(app.state.ctx.discovery.known_peers):
+        try:
+            host, port = parse_hostport(peer)
+            resp = await send_message(host, port, msg, timeout=3.0, ssl_ctx=app.state.client_ssl_ctx)
+            results["peers"].append({"peer": peer, "resp": resp})
+        except Exception as e:
+            results["peers"].append({"peer": peer, "error": str(e)})
+
+    return results
 
 
 async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) -> dict:
@@ -272,7 +298,13 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
             return {"type": "ERROR", "reason": "mTLS_required"}
 
         if store.is_blocked(peer_node_id):
-            ctx.log_event("SECURITY_AUTH_FAILED", severity="ERROR", reason="blocklisted", source_node_id=peer_node_id, source_peer=source_peer)
+            ctx.log_event(
+                "SECURITY_AUTH_FAILED",
+                severity="ERROR",
+                reason="blocklisted",
+                source_node_id=peer_node_id,
+                source_peer=source_peer,
+            )
             return {"type": "ERROR", "reason": "blocklisted"}
 
         if require_allow and (not store.is_allowed(peer_node_id)):
@@ -291,12 +323,33 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
                         "last_seen": now,
                     },
                 )
-                ctx.log_event("NODE_JOIN_REQUESTED", severity="WARNING", reason_code="not_allowlisted", source_node_id=peer_node_id, source_peer=source_peer)
-
+                ctx.log_event(
+                    "NODE_JOIN_REQUESTED",
+                    severity="WARNING",
+                    reason_code="not_allowlisted",
+                    source_node_id=peer_node_id,
+                    source_peer=source_peer,
+                )
             return {"type": "ERROR", "reason": "pending_approval"}
 
     if peer_node_id:
         app.state.membership.observe(peer_node_id, peer_addr=source_peer)
+
+    if t == "SYNC_START":
+        try:
+            await ctx.start_sync()
+            app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={"sync_running": True})
+            return {"type": "SYNC_ACK", "ok": True, "action": "start", "node_id": ctx.node_id}
+        except Exception as e:
+            return {"type": "SYNC_ACK", "ok": False, "action": "start", "error": str(e), "node_id": ctx.node_id}
+
+    if t == "SYNC_STOP":
+        try:
+            await ctx.stop_sync()
+            app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={"sync_running": False})
+            return {"type": "SYNC_ACK", "ok": True, "action": "stop", "node_id": ctx.node_id}
+        except Exception as e:
+            return {"type": "SYNC_ACK", "ok": False, "action": "stop", "error": str(e), "node_id": ctx.node_id}
 
     if t == "PING":
         return {"type": "PONG", "from": ctx.node_id}
@@ -306,7 +359,6 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
         if isinstance(peer_listen, str) and ":" in peer_listen:
             ctx.discovery.merge([peer_listen])
             if tls_enabled and peer_node_id:
-                ctx.learn_peer_identity(peer_listen, peer_node_id)
                 app.state.membership.observe(peer_node_id, peer_addr=peer_listen)
         return {"type": "HELLO_ACK", "from": ctx.node_id, "peers": sorted(ctx.discovery.known_peers)}
 
@@ -323,7 +375,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
         metrics = msg.get("metrics", {})
         sender = peer_node_id if tls_enabled else msg.get("sender")
         if isinstance(sender, str) and isinstance(metrics, dict):
-            ctx.upsert_peer_metrics(sender, metrics)
+            ctx.metrics_by_node[sender] = metrics
             app.state.membership.observe(sender, peer_addr=source_peer, metrics=metrics)
         return {"type": "METRICS_ACK"}
 
@@ -367,22 +419,28 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
 async def metrics_loop(ctx: NodeRuntime, app: FastAPI) -> None:
     while True:
         if not ctx.zeta_proc:
+            app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={"sync_running": False})
             await asyncio.sleep(1)
             continue
 
         st = ctx.zeta_proc.status()
         if not st.running:
+            app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={"sync_running": False})
             await asyncio.sleep(1)
             continue
 
         async for line in ctx.zeta_proc.stdout_lines():
             parsed = parse_metrics_line(line)
             if parsed:
-                ctx.upsert_peer_metrics(ctx.node_id, parsed)
+                parsed["sync_running"] = True
+                ctx.metrics_by_node[ctx.node_id] = parsed
                 app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics=parsed)
 
                 if has_min_disk_free(LOG_DIR):
-                    append_jsonl(METRICS_LOG, {"ts": time.time(), "node_id": ctx.node_id, "sequence_id": ctx.next_seq(), "metrics": parsed})
+                    append_jsonl(
+                        METRICS_LOG,
+                        {"ts": time.time(), "node_id": ctx.node_id, "sequence_id": ctx.next_seq(), "metrics": parsed},
+                    )
 
         await asyncio.sleep(0.2)
 
@@ -419,18 +477,12 @@ async def membership_loop(ctx: NodeRuntime, app: FastAPI) -> None:
         transitions = app.state.membership.tick()
 
         for nid in transitions.get("became_offline", []):
-            ctx.excluded_nodes.add(nid)
             ctx.log_event("NODE_OFFLINE", severity="WARNING", node_id=nid, reason_code="unreachable")
-
         for nid in transitions.get("became_online", []):
             ctx.log_event("NODE_RECOVERED", severity="WARNING", node_id=nid, reason_code="reachable_again")
-
         for nid, reason in transitions.get("excluded", []):
-            ctx.excluded_nodes.add(nid)
             ctx.log_event("NODE_EXCLUDED", severity="WARNING", node_id=nid, reason_code=reason)
-
         for nid in transitions.get("reincluded", []):
-            ctx.excluded_nodes.discard(nid)
             ctx.log_event("NODE_REINCLUDED", severity="WARNING", node_id=nid, reason_code="healthy_again")
 
         health = app.state.membership.export_cluster().get("cluster_health")
@@ -484,7 +536,7 @@ def create_app() -> FastAPI:
         healthy_stability_threshold=float(os.getenv("HEALTHY_STABILITY_THRESHOLD", "0.995")),
         healthy_consecutive=int(os.getenv("HEALTHY_CONSECUTIVE_TICKS", "10")),
     )
-    app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={})
+    app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={"sync_running": False})
 
     store = SecurityStore(SECURITY_JSON)
     app.state.security_store = store
@@ -557,16 +609,19 @@ def create_app() -> FastAPI:
 
     @app.post("/mgmt/cluster/start")
     async def mgmt_start():
-        try:
-            await app.state.ctx.start_sync()
-            return {"ok": True}
-        except RuntimeError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        res = await broadcast_sync(app, "start")
+        ok = bool(res.get("local", {}).get("ok", False))
+        if not ok:
+            raise HTTPException(status_code=400, detail=res["local"])
+        return {"ok": True, **res}
 
     @app.post("/mgmt/cluster/stop")
     async def mgmt_stop():
-        await app.state.ctx.stop_sync()
-        return {"ok": True}
+        res = await broadcast_sync(app, "stop")
+        ok = bool(res.get("local", {}).get("ok", False))
+        if not ok:
+            raise HTTPException(status_code=400, detail=res["local"])
+        return {"ok": True, **res}
 
     @app.post("/mgmt/security/ca/init")
     async def mgmt_ca_init():
@@ -582,11 +637,8 @@ def create_app() -> FastAPI:
                 node_id=app.state.ctx.node_id,
                 validity_days=app.state.node_validity_days,
             )
-
             atomic_write(app.state.node_key_path, node_key_pem.decode("utf-8"))
             atomic_write(app.state.node_cert_path, node_cert_pem.decode("utf-8"))
-            atomic_write(app.state.ca_cert_path, app.state.ca_cert_path.read_text(encoding="utf-8"))
-
             created_self_identity = True
             app.state.ctx.log_event("TLS_SELF_IDENTITY_ISSUED", severity="WARNING", node_id=app.state.ctx.node_id)
 
@@ -650,7 +702,8 @@ def create_app() -> FastAPI:
             app.state.ctx.log_event("BOOTSTRAP_ISSUE_DENIED", severity="ERROR", node_id=node_id_req, reason="bad_token")
             raise HTTPException(status_code=403, detail="invalid bootstrap token")
 
-        ensure_cluster_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path), validity_days=int(os.getenv("TLS_CA_VALIDITY_DAYS", "3650")))
+        if not (app.state.ca_key_path.exists() and app.state.ca_cert_path.exists()):
+            raise HTTPException(status_code=400, detail="CA not initialized on authority node. Click Init CA first.")
 
         ca_key, ca_cert = load_ca(CAPaths(app.state.ca_key_path, app.state.ca_cert_path))
         node_key_pem, node_cert_pem = issue_node_cert(ca_key, ca_cert, node_id=node_id_req, validity_days=app.state.node_validity_days)
@@ -704,6 +757,7 @@ def create_app() -> FastAPI:
     async def api_cluster_status():
         base = app.state.ctx.cluster_status()
         base["cluster"] = app.state.membership.export_cluster()
+        base["sync_running"] = bool(app.state.ctx.sync_running())
         return base
 
     @app.get("/api/v1/cluster/health")
