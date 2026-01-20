@@ -261,7 +261,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     stable_peer_addr = (
         peer_listen
         if isinstance(peer_listen, str) and ":" in peer_listen
-        else source_peer
+        else None
     )
 
     if tls_enabled:
@@ -301,7 +301,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
 
             return {"type": "ERROR", "reason": "pending_approval"}
 
-    if peer_node_id:
+    if peer_node_id and stable_peer_addr:
         app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr)
 
     if t == "PING":
@@ -310,7 +310,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     if t == "HELLO":
         if isinstance(peer_listen, str) and ":" in peer_listen:
             ctx.discovery.merge([peer_listen])
-            if tls_enabled and peer_node_id:
+            if tls_enabled and peer_node_id and stable_peer_addr:
                 ctx.learn_peer_identity(peer_listen, peer_node_id)
                 app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr)
         return {"type": "HELLO_ACK", "from": ctx.node_id, "peers": sorted(ctx.discovery.known_peers)}
@@ -327,7 +327,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     if t == "METRICS_PUSH":
         metrics = msg.get("metrics", {})
         sender = peer_node_id if tls_enabled else msg.get("sender")
-        if isinstance(sender, str) and isinstance(metrics, dict) and peer_listen:
+        if isinstance(sender, str) and isinstance(metrics, dict) and stable_peer_addr:
             ctx.upsert_peer_metrics(sender, metrics)
             app.state.membership.observe(sender, peer_addr=stable_peer_addr, metrics=metrics)
         return {"type": "METRICS_ACK"}
