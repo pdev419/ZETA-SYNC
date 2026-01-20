@@ -3,9 +3,8 @@ module.exports = {
     {
       name: "zeta-sync",
       cwd: __dirname,
-      script: "./.venv/bin/python",
-      args: "-m uvicorn main:app --host 0.0.0.0 --port 8080",
-      env: { APP_ENV: "prod" },
+      interpreter: "./.venv/bin/python",
+      script: "main.py",
       autorestart: true,
       watch: false
     }
