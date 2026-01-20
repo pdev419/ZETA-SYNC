@@ -232,6 +232,7 @@ class NodeRuntime:
     async def stop_sync(self) -> None:
         if self.zeta_proc:
             await self.zeta_proc.stop()
+        self.zeta_proc = None
         self.log_event("SYNC_STOPPED")
         self.sync_running = False
         self.sync_last_change_ts = time.time()
