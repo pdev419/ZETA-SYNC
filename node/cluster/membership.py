@@ -13,6 +13,8 @@ class MemberInfo:
 
     last_seen: float = field(default_factory=lambda: time.time())
     online: bool = True
+    sync_running: bool = False
+    last_metrics_ts: float = 0.0
 
     excluded: bool = False
     exclude_reason: Optional[str] = None
@@ -81,22 +83,31 @@ class MembershipTracker:
             m.peer_addr = peer_addr
         return m
 
-    def observe(self, node_id: str, peer_addr: Optional[str], metrics: Optional[Dict[str, Any]] = None) -> MemberInfo:
+    def observe(
+        self,
+        node_id: str,
+        peer_addr: Optional[str],
+        metrics: Optional[Dict[str, Any]] = None,
+        sync_running: Optional[bool] = None,
+    ) -> MemberInfo:
         m = self.ensure_member(node_id, peer_addr)
         m.last_seen = time.time()
         m.online = True
-        if metrics and isinstance(metrics, dict):
-            m.metrics.update(metrics)
 
-        sync_running = bool(m.metrics.get("sync_running", True))
+        if sync_running is not None:
+            m.sync_running = bool(sync_running)
+
+        if metrics and isinstance(metrics, dict):
+            m.metrics = metrics
+            m.last_metrics_ts = time.time()
 
         if m.excluded:
             m.state = "RECOVERING"
         else:
-            if not sync_running:
+            if not m.sync_running:
                 m.state = "PAUSED"
             else:
-                m.state = "ACTIVE" if (m.metrics and len(m.metrics) > 1) else "JOINING"
+                m.state = "ACTIVE" if (m.metrics and len(m.metrics) > 0) else "JOINING"
         return m
 
     def tick(self) -> Dict[str, Any]:
@@ -153,7 +164,7 @@ class MembershipTracker:
                     m.exclude_reason = None
                     m.recover_streak = 0
                     m.outlier_streak = 0
-                    m.state = "PAUSED" if (not bool(m.metrics.get("sync_running", True))) else "ACTIVE"
+                    m.state = "ACTIVE" if m.sync_running else "PAUSED"
                     reincluded.append(node_id)
 
         self._derive()
@@ -172,7 +183,7 @@ class MembershipTracker:
 
         active_members = [
             m for m in self.members.values()
-            if m.online and (not m.excluded) and (m.state != "PAUSED")
+            if m.online and (not m.excluded) and m.sync_running
         ]
         active = len(active_members)
 
@@ -252,6 +263,8 @@ class MembershipTracker:
                     "state": m.state,
                     "online": m.online,
                     "last_seen": m.last_seen,
+                    "sync_running": m.sync_running,
+                    "last_metrics_ts": m.last_metrics_ts,
                     "excluded": m.excluded,
                     "reason": m.exclude_reason,
                     "metrics": m.metrics,

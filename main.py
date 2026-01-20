@@ -9,16 +9,16 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
+from fastapi.templating import Jinja2Templates
 
 from node.agent.discovery import Discovery, parse_hostport
 from node.cluster.membership import MembershipTracker
@@ -148,6 +148,8 @@ class NodeRuntime:
 
     metrics_by_node: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     zeta_proc: Optional[ZetaSyncProcess] = None
+    sync_running: bool = False
+    sync_last_change_ts: float = field(default_factory=lambda: time.time())
 
     local_seq: int = 0
     _event_throttle: Dict[str, float] = field(default_factory=dict)
@@ -224,11 +226,15 @@ class NodeRuntime:
             raise RuntimeError(f"ZETA_SYNC_CMD not executable. chmod +x '{self.settings.zeta_sync_cmd}'.") from e
 
         self.log_event("SYNC_STARTED", cmd=[self.settings.zeta_sync_cmd] + self.settings.zeta_sync_args)
+        self.sync_running = True
+        self.sync_last_change_ts = time.time()
 
     async def stop_sync(self) -> None:
         if self.zeta_proc:
             await self.zeta_proc.stop()
         self.log_event("SYNC_STOPPED")
+        self.sync_running = False
+        self.sync_last_change_ts = time.time()
 
     def sync_running(self) -> bool:
         if not self.zeta_proc:
@@ -239,38 +245,13 @@ class NodeRuntime:
             return False
 
 
-async def broadcast_sync(app: FastAPI, action: str) -> dict:
-    msg = {"type": "SYNC_START"} if action == "start" else {"type": "SYNC_STOP"}
-    results: dict = {"local": None, "peers": []}
-
-    try:
-        if action == "start":
-            await app.state.ctx.start_sync()
-            app.state.membership.observe(
-                app.state.ctx.node_id,
-                peer_addr=app.state.ctx.advertise_addr(),
-                metrics={"sync_running": True},
-            )
-        else:
-            await app.state.ctx.stop_sync()
-            app.state.membership.observe(
-                app.state.ctx.node_id,
-                peer_addr=app.state.ctx.advertise_addr(),
-                metrics={"sync_running": False},
-            )
-        results["local"] = {"ok": True}
-    except Exception as e:
-        results["local"] = {"ok": False, "error": str(e)}
-
-    for peer in list(app.state.ctx.discovery.known_peers):
-        try:
-            host, port = parse_hostport(peer)
-            resp = await send_message(host, port, msg, timeout=3.0, ssl_ctx=app.state.client_ssl_ctx)
-            results["peers"].append({"peer": peer, "resp": resp})
-        except Exception as e:
-            results["peers"].append({"peer": peer, "error": str(e)})
-
-    return results
+    def cluster_status(self) -> Dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "advertise_addr": self.advertise_addr(),
+            "known_peers": sorted(self.discovery.known_peers),
+            "sync_running": bool(self.sync_running),
+        }
 
 
 async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) -> dict:
@@ -284,6 +265,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     peer_node_id = _cn_from_peer_cert(peer_cert) if tls_enabled else None
     source_peer = str(meta.get("peer_id") or "")
     peer_listen = msg.get("listen")
+    peer_sync_running = msg.get("sync_running")
     stable_peer_addr = (
         peer_listen
         if isinstance(peer_listen, str) and ":" in peer_listen
@@ -339,7 +321,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
             return {"type": "ERROR", "reason": "pending_approval"}
 
     if peer_node_id and stable_peer_addr:
-        app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr)
+        app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr, sync_running=peer_sync_running)
 
     if t == "SYNC_START":
         try:
@@ -365,7 +347,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
             ctx.discovery.merge([peer_listen])
             if tls_enabled and peer_node_id and stable_peer_addr:
                 ctx.learn_peer_identity(peer_listen, peer_node_id)
-                app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr)
+                app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr, sync_running=peer_sync_running)
         return {"type": "HELLO_ACK", "from": ctx.node_id, "peers": sorted(ctx.discovery.known_peers)}
 
     if t == "PEER_LIST_REQ":
@@ -380,9 +362,10 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     if t == "METRICS_PUSH":
         metrics = msg.get("metrics", {})
         sender = peer_node_id if tls_enabled else msg.get("sender")
+        sr = msg.get("sync_running")
         if isinstance(sender, str) and isinstance(metrics, dict) and stable_peer_addr:
             ctx.upsert_peer_metrics(sender, metrics)
-            app.state.membership.observe(sender, peer_addr=stable_peer_addr, metrics=metrics)
+            app.state.membership.observe(sender, peer_addr=stable_peer_addr, metrics=metrics, sync_running=sr)
         return {"type": "METRICS_ACK"}
 
     return {"type": "ERROR", "reason": f"Unknown type {t}"}
@@ -401,7 +384,7 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
                 if isinstance(peers, list):
                     ctx.discovery.merge([p for p in peers if isinstance(p, str)])
 
-                await send_message(host, port, {"type": "HELLO", "listen": advertise}, ssl_ctx=app.state.client_ssl_ctx)
+                await send_message(host, port, {"type": "HELLO", "listen": advertise, "sync_running": bool(ctx.sync_running)}, ssl_ctx=app.state.client_ssl_ctx)
             except Exception:
                 continue
 
@@ -415,7 +398,7 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
                 if isinstance(peers, list):
                     ctx.discovery.merge([p for p in peers if isinstance(p, str)])
 
-                await send_message(host, port, {"type": "HELLO", "listen": advertise}, ssl_ctx=app.state.client_ssl_ctx)
+                await send_message(host, port, {"type": "HELLO", "listen": advertise, "sync_running": bool(ctx.sync_running)}, ssl_ctx=app.state.client_ssl_ctx)
             except Exception:
                 continue
 
@@ -438,9 +421,15 @@ async def metrics_loop(ctx: NodeRuntime, app: FastAPI) -> None:
         async for line in ctx.zeta_proc.stdout_lines():
             parsed = parse_metrics_line(line)
             if parsed:
-                parsed["sync_running"] = True
-                ctx.metrics_by_node[ctx.node_id] = parsed
-                app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics=parsed)
+                ctx.upsert_peer_metrics(ctx.node_id, parsed)
+
+                ctx.sync_running = True
+                app.state.membership.observe(
+                    ctx.node_id,
+                    peer_addr=ctx.advertise_addr(),
+                    metrics=parsed,
+                    sync_running=True,
+                )
 
                 if has_min_disk_free(LOG_DIR):
                     append_jsonl(
@@ -467,7 +456,13 @@ async def metrics_push_loop(ctx: NodeRuntime, app: FastAPI) -> None:
                 await send_message(
                     host,
                     port,
-                    {"type": "METRICS_PUSH", "sender": ctx.node_id, "listen": advertise, "metrics": local},
+                    {
+                        "type": "METRICS_PUSH",
+                        "sender": ctx.node_id,
+                        "listen": advertise,
+                        "metrics": local,
+                        "sync_running": bool(ctx.sync_running),
+                    },
                     timeout=2.0,
                     ssl_ctx=app.state.client_ssl_ctx,
                 )
@@ -542,7 +537,8 @@ def create_app() -> FastAPI:
         healthy_stability_threshold=float(os.getenv("HEALTHY_STABILITY_THRESHOLD", "0.995")),
         healthy_consecutive=int(os.getenv("HEALTHY_CONSECUTIVE_TICKS", "10")),
     )
-    app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={"sync_running": False})
+
+    app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={}, sync_running=False)
 
     store = SecurityStore(SECURITY_JSON)
     app.state.security_store = store
@@ -615,19 +611,18 @@ def create_app() -> FastAPI:
 
     @app.post("/mgmt/cluster/start")
     async def mgmt_start():
-        res = await broadcast_sync(app, "start")
-        ok = bool(res.get("local", {}).get("ok", False))
-        if not ok:
-            raise HTTPException(status_code=400, detail=res["local"])
-        return {"ok": True, **res}
+        try:
+            await app.state.ctx.start_sync()
+            app.state.membership.observe(app.state.ctx.node_id, peer_addr=app.state.ctx.advertise_addr(), sync_running=True)
+            return {"ok": True}
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/mgmt/cluster/stop")
     async def mgmt_stop():
-        res = await broadcast_sync(app, "stop")
-        ok = bool(res.get("local", {}).get("ok", False))
-        if not ok:
-            raise HTTPException(status_code=400, detail=res["local"])
-        return {"ok": True, **res}
+        await app.state.ctx.stop_sync()
+        app.state.membership.observe(app.state.ctx.node_id, peer_addr=app.state.ctx.advertise_addr(), sync_running=False)
+        return {"ok": True}
 
     @app.post("/mgmt/security/ca/init")
     async def mgmt_ca_init():
@@ -777,7 +772,7 @@ def create_app() -> FastAPI:
             known = set([m.get("peer_addr") for m in nodes if m.get("peer_addr")])
             for p in sorted(app.state.ctx.discovery.known_peers):
                 if p not in known:
-                    nodes.append({"node_id": None, "peer_addr": p, "state": "UNKNOWN", "online": False, "excluded": False, "reason": None, "metrics": {}})
+                    nodes.append({"node_id": None, "peer_addr": p, "state": "UNKNOWN", "online": False, "sync_running": False, "excluded": False, "reason": None, "metrics": {}})
         return {"nodes": nodes, "cluster": app.state.membership.export_cluster()}
 
     @app.get("/api/v1/cluster/events")
