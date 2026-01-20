@@ -23,13 +23,15 @@
       <div class="card">
         <div class="row spread">
           <div>
-            <h2 style="margin:0">Event stream</h2>
-            <div class="muted">Sorted by timestamp. sequence_id is per-node.</div>
+            <h2 style="margin:0">Event Log</h2>
           </div>
-          <button class="btn" onclick="loadEvents()">Refresh</button>
+          <div class="row">
+            <button class="btn" onclick="loadEvents(true)">Refresh</button>
+            <button class="btn warn" onclick="toggleAutoRefresh()"><span id="autoBtn">Pause</span> auto</button>
+          </div>
         </div>
 
-        <div id="events"></div>
+        <div id="eventsList"></div>
 
         <details class="adv">
           <summary>Advanced / Debug</summary>
@@ -40,49 +42,121 @@
 
     <script src="/static/app.js"></script>
     <script>
-      function fmtTs(ts){
-        if(!ts) return "-";
-        const d = new Date(ts*1000);
-        return d.toLocaleString();
+      const expanded = new Set();
+
+      let autoOn = true;
+      let timer = null;
+
+      function toggleAutoRefresh(){
+        autoOn = !autoOn;
+        document.getElementById("autoBtn").textContent = autoOn ? "Pause" : "Resume";
+        if(autoOn){
+          schedule();
+          loadEvents(false);
+        } else {
+          if(timer) clearInterval(timer);
+          timer = null;
+        }
       }
 
-      function row(e){
-        const id = (e.event_id || "").slice(0,10);
-        const sev = (e.severity || "INFO").toLowerCase();
+      function schedule(){
+        if(timer) return;
+        timer = setInterval(() => {
+          if(!autoOn) return;
+          loadEvents(false);
+        }, 2000);
+      }
+
+      function eventKey(ev){
+        return ev.event_id || (String(ev.node_id||"") + ":" + String(ev.sequence_id||"") + ":" + String(ev.ts||""));
+      }
+
+      function fmtTs(ts){
+        if(!ts) return "-";
+        try{
+          const d = new Date(ts * 1000);
+          return d.toLocaleString();
+        }catch{
+          return String(ts);
+        }
+      }
+
+      function renderEvent(ev){
+        const k = eventKey(ev);
+        const sev = String(ev.severity || "INFO").toUpperCase();
+        const pillCls = (sev === "ERROR") ? "error" : (sev === "WARNING" ? "warning" : "info");
+
+        const title = `${escapeHtml(ev.event_type || "EVENT")} · ${escapeHtml(sev)}`;
+        const metaLine =
+          `${escapeHtml(fmtTs(ev.ts))} · node=${escapeHtml(ev.node_id || "-")} · seq=${escapeHtml(ev.sequence_id ?? "-")}`;
+
+        const raw = JSON.stringify(ev, null, 2);
+
         return `
           <div class="event">
             <div class="row spread">
-              <div class="mono small">${escapeHtml(fmtTs(e.ts))}</div>
-              <div class="pill ${sev}">${escapeHtml(e.severity || "INFO")}</div>
-            </div>
-            <div class="row spread">
               <div>
-                <b>${escapeHtml(e.event_type || "-")}</b>
-                <div class="muted small">
-                  node: <span class="mono">${escapeHtml(e.node_id || "-")}</span> ·
-                  seq: <span class="mono">${escapeHtml(String(e.sequence_id ?? "-"))}</span> ·
-                  id: <span class="mono">${escapeHtml(id)}</span>
-                </div>
+                <div><b>${title}</b></div>
+                <div class="muted small">${metaLine}</div>
               </div>
+              <div class="pill ${pillCls}">${escapeHtml(sev)}</div>
             </div>
 
-            <details class="adv">
+            <details class="adv evDetails" data-key="${escapeHtml(k)}">
               <summary>Details</summary>
-              <pre>${escapeHtml(JSON.stringify(e, null, 2))}</pre>
+              <pre>${escapeHtml(raw)}</pre>
             </details>
           </div>
         `;
       }
 
-      async function loadEvents(){
-        const res = await fetch("/api/v1/cluster/events?limit=200").then(r=>r.json());
-        const events = res.events || [];
-        document.getElementById("events").innerHTML = events.map(row).join("") || `<div class="muted">No events.</div>`;
-        document.getElementById("rawEvents").textContent = JSON.stringify(res, null, 2);
+      function captureExpanded(){
+        document.querySelectorAll("details.evDetails").forEach(d => {
+          const k = d.getAttribute("data-key");
+          if(!k) return;
+          if(d.open) expanded.add(k);
+          else expanded.delete(k);
+        });
       }
 
-      loadEvents();
-      setInterval(loadEvents, 2500);
+      function restoreExpanded(){
+        document.querySelectorAll("details.evDetails").forEach(d => {
+          const k = d.getAttribute("data-key");
+          if(k && expanded.has(k)) d.open = true;
+
+          d.addEventListener("toggle", () => {
+            const kk = d.getAttribute("data-key");
+            if(!kk) return;
+            if(d.open) expanded.add(kk);
+            else expanded.delete(kk);
+          }, { passive: true });
+        });
+      }
+
+      let lastPayloadHash = "";
+
+      async function loadEvents(force){
+        captureExpanded();
+
+        const res = await fetch("/api/v1/cluster/events?limit=200").then(r => r.json());
+        const events = res.events || [];
+
+        const payloadHash = JSON.stringify(events.map(e => e.event_id || e.sequence_id || e.ts || "")).slice(0, 2000);
+        if(!force && payloadHash === lastPayloadHash){
+          document.getElementById("rawEvents").textContent = JSON.stringify(res, null, 2);
+          return;
+        }
+        lastPayloadHash = payloadHash;
+
+        const html = events.map(renderEvent).join("");
+        document.getElementById("eventsList").innerHTML = html || `<div class="muted">No events yet.</div>`;
+        document.getElementById("rawEvents").textContent = JSON.stringify(res, null, 2);
+
+        restoreExpanded();
+      }
+
+      loadEvents(true);
+      schedule();
     </script>
   </body>
 </html>
