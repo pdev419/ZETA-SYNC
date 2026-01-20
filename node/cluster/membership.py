@@ -1,9 +1,20 @@
 # node/cluster/membership.py
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
+
+
+def _env_float(key: str, default: float) -> float:
+    v = os.getenv(key)
+    if v is None or str(v).strip() == "":
+        return default
+    return float(v)
+
+
+METRICS_STALE_SEC = _env_float("METRICS_STALE_SEC", 5.0)
 
 
 @dataclass
@@ -13,7 +24,7 @@ class MemberInfo:
 
     last_seen: float = field(default_factory=lambda: time.time())
     online: bool = True
-    sync_running: bool = False
+    # last time we observed metrics for this node
     last_metrics_ts: float = 0.0
 
     excluded: bool = False
@@ -25,6 +36,9 @@ class MemberInfo:
     recover_streak: int = 0
 
     metrics: Dict[str, Any] = field(default_factory=dict)
+
+    def has_fresh_metrics(self, now: float) -> bool:
+        return self.last_metrics_ts > 0 and (now - self.last_metrics_ts) <= METRICS_STALE_SEC
 
 
 @dataclass
@@ -39,7 +53,7 @@ class ClusterDerived:
     exclude_reasons: Dict[str, str] = field(default_factory=dict)
 
     reference_z: Optional[float] = None
-    reference_method: Optional[str] = None
+    reference_method: Optional[str] = None  # median3 | mean2 | single
 
     healthy_streak: int = 0
     healthy_required: int = 10
@@ -90,8 +104,9 @@ class MembershipTracker:
         metrics: Optional[Dict[str, Any]] = None,
         sync_running: Optional[bool] = None,
     ) -> MemberInfo:
+        now = time.time()
         m = self.ensure_member(node_id, peer_addr)
-        m.last_seen = time.time()
+        m.last_seen = now
         m.online = True
 
         if sync_running is not None:
@@ -99,15 +114,20 @@ class MembershipTracker:
 
         if metrics and isinstance(metrics, dict):
             m.metrics = metrics
-            m.last_metrics_ts = time.time()
+            m.last_metrics_ts = now
 
-        if m.excluded:
+        if not m.online:
+            m.state = "OFFLINE"
+        elif m.excluded:
             m.state = "RECOVERING"
+        elif not m.sync_running:
+            m.state = "PAUSED"
         else:
-            if not m.sync_running:
-                m.state = "PAUSED"
+            if m.has_fresh_metrics(now):
+                m.state = "ACTIVE"
             else:
-                m.state = "ACTIVE" if (m.metrics and len(m.metrics) > 0) else "JOINING"
+                m.state = "JOINING"
+
         return m
 
     def tick(self) -> Dict[str, Any]:
@@ -164,10 +184,25 @@ class MembershipTracker:
                     m.exclude_reason = None
                     m.recover_streak = 0
                     m.outlier_streak = 0
-                    m.state = "ACTIVE" if m.sync_running else "PAUSED"
+                    if not m.sync_running:
+                        m.state = "PAUSED"
+                    else:
+                        m.state = "ACTIVE" if m.has_fresh_metrics(now) else "JOINING"
                     reincluded.append(node_id)
 
-        self._derive()
+        for m in self.members.values():
+            if not m.online:
+                m.state = "OFFLINE"
+                continue
+            if m.excluded:
+                m.state = "RECOVERING"
+                continue
+            if not m.sync_running:
+                m.state = "PAUSED"
+                continue
+            m.state = "ACTIVE" if m.has_fresh_metrics(now) else "JOINING"
+
+        self._derive(now)
         return {
             "became_offline": became_offline,
             "became_online": became_online,
@@ -175,17 +210,17 @@ class MembershipTracker:
             "reincluded": reincluded,
         }
 
-    def _derive(self) -> None:
+    def _derive(self, now: float) -> None:
         expected = self.expected_cluster_size
         quorum_needed = (expected // 2) + 1
         self.cluster.expected_nodes = expected
         self.cluster.quorum_needed = quorum_needed
 
-        active_members = [
+        participating = [
             m for m in self.members.values()
-            if m.online and (not m.excluded) and m.sync_running
+            if m.online and (not m.excluded) and m.sync_running and m.has_fresh_metrics(now)
         ]
-        active = len(active_members)
+        active = len(participating)
 
         self.cluster.active_nodes = active
         self.cluster.quorum = f"{active}/{expected}"
@@ -197,7 +232,7 @@ class MembershipTracker:
         }
 
         zs = []
-        for m in active_members:
+        for m in participating:
             z = m.metrics.get("z")
             if isinstance(z, (int, float)):
                 zs.append(float(z))
@@ -218,9 +253,10 @@ class MembershipTracker:
 
         has_quorum = active >= quorum_needed
         has_exclusions = len(excluded_nodes) > 0
+        all_required_active = (active >= expected)
 
         stabs = []
-        for m in active_members:
+        for m in participating:
             s = m.metrics.get("stability")
             if isinstance(s, (int, float)):
                 stabs.append(float(s))
@@ -228,7 +264,8 @@ class MembershipTracker:
         cluster_stab = stabs[len(stabs) // 2] if stabs else None
 
         healthy_now = (
-            has_quorum
+            all_required_active
+            and has_quorum
             and (not has_exclusions)
             and (cluster_stab is not None)
             and (cluster_stab >= self.cluster.healthy_stability_threshold)
