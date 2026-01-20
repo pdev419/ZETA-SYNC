@@ -258,6 +258,11 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     peer_node_id = _cn_from_peer_cert(peer_cert) if tls_enabled else None
     source_peer = str(meta.get("peer_id") or "")
     peer_listen = msg.get("listen")
+    stable_peer_addr = (
+        peer_listen
+        if isinstance(peer_listen, str) and ":" in peer_listen
+        else source_peer
+    )
 
     if tls_enabled:
         if not peer_node_id:
@@ -297,7 +302,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
             return {"type": "ERROR", "reason": "pending_approval"}
 
     if peer_node_id:
-        app.state.membership.observe(peer_node_id, peer_addr=source_peer)
+        app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr)
 
     if t == "PING":
         return {"type": "PONG", "from": ctx.node_id}
@@ -307,7 +312,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
             ctx.discovery.merge([peer_listen])
             if tls_enabled and peer_node_id:
                 ctx.learn_peer_identity(peer_listen, peer_node_id)
-                app.state.membership.observe(peer_node_id, peer_addr=peer_listen)
+                app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr)
         return {"type": "HELLO_ACK", "from": ctx.node_id, "peers": sorted(ctx.discovery.known_peers)}
 
     if t == "PEER_LIST_REQ":
@@ -324,7 +329,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
         sender = peer_node_id if tls_enabled else msg.get("sender")
         if isinstance(sender, str) and isinstance(metrics, dict) and peer_listen:
             ctx.upsert_peer_metrics(sender, metrics)
-            app.state.membership.observe(sender, peer_addr=peer_listen, metrics=metrics)
+            app.state.membership.observe(sender, peer_addr=stable_peer_addr, metrics=metrics)
         return {"type": "METRICS_ACK"}
 
     return {"type": "ERROR", "reason": f"Unknown type {t}"}
