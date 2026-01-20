@@ -257,6 +257,9 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     peer_cert = meta.get("peer_cert") if isinstance(meta, dict) else None
     peer_node_id = _cn_from_peer_cert(peer_cert) if tls_enabled else None
     source_peer = str(meta.get("peer_id") or "")
+    peer_listen = msg.get("listen")
+
+    print("peer_handler", source_peer, peer_listen)
 
     if tls_enabled:
         if not peer_node_id:
@@ -302,7 +305,6 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
         return {"type": "PONG", "from": ctx.node_id}
 
     if t == "HELLO":
-        peer_listen = msg.get("listen")
         if isinstance(peer_listen, str) and ":" in peer_listen:
             ctx.discovery.merge([peer_listen])
             if tls_enabled and peer_node_id:
@@ -324,7 +326,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
         sender = peer_node_id if tls_enabled else msg.get("sender")
         if isinstance(sender, str) and isinstance(metrics, dict):
             ctx.upsert_peer_metrics(sender, metrics)
-            app.state.membership.observe(sender, peer_addr=source_peer, metrics=metrics)
+            app.state.membership.observe(sender, peer_addr=peer_listen, metrics=metrics)
         return {"type": "METRICS_ACK"}
 
     return {"type": "ERROR", "reason": f"Unknown type {t}"}
