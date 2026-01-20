@@ -87,8 +87,7 @@
         const pillCls = (sev === "ERROR") ? "error" : (sev === "WARNING" ? "warning" : "info");
 
         const title = `${escapeHtml(ev.event_type || "EVENT")} · ${escapeHtml(sev)}`;
-        const metaLine =
-          `${escapeHtml(fmtTs(ev.ts))} · node=${escapeHtml(ev.node_id || "-")} · seq=${escapeHtml(ev.sequence_id ?? "-")}`;
+        const metaLine = `node=${escapeHtml(ev.node_id || "-")} · seq=${escapeHtml(ev.sequence_id ?? "-")} · debug_ts=${escapeHtml(fmtTs(ev.ts))}`;
 
         const raw = JSON.stringify(ev, null, 2);
 

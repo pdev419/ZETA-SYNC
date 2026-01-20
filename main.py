@@ -754,8 +754,24 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/cluster/events")
     async def api_events(limit: int = 200):
         ev = tail_jsonl(EVENTS_LOG, limit=min(max(1, limit), 1000))
-        ev_sorted = sorted(ev, key=lambda x: float(x.get("ts", 0)), reverse=True)
-        return {"events": ev_sorted}
+
+        def seq(v):
+            try:
+                return int(v)
+            except Exception:
+                return -1
+
+        ev_sorted = sorted(
+            ev,
+            key=lambda x: (seq(x.get("sequence_id")), str(x.get("node_id") or "")),
+            reverse=True,
+        )
+
+        return {
+            "ordering": "sequence_id_desc_then_node_id",
+            "note": "ts is local debug timestamp only; not used for ordering",
+            "events": ev_sorted,
+        }
 
     @app.get("/api/v1/security/ca/status")
     async def api_ca_status():
