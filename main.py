@@ -259,8 +259,6 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     source_peer = str(meta.get("peer_id") or "")
     peer_listen = msg.get("listen")
 
-    print("peer_handler", source_peer, peer_listen)
-
     if tls_enabled:
         if not peer_node_id:
             window = float(os.getenv("SECURITY_AUTH_FAIL_THROTTLE_SEC", "5"))
@@ -324,7 +322,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     if t == "METRICS_PUSH":
         metrics = msg.get("metrics", {})
         sender = peer_node_id if tls_enabled else msg.get("sender")
-        if isinstance(sender, str) and isinstance(metrics, dict):
+        if isinstance(sender, str) and isinstance(metrics, dict) and peer_listen:
             ctx.upsert_peer_metrics(sender, metrics)
             app.state.membership.observe(sender, peer_addr=peer_listen, metrics=metrics)
         return {"type": "METRICS_ACK"}
