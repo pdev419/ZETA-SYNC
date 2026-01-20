@@ -46,6 +46,7 @@
         const m = n.metrics || {};
         const st = n.state || "UNKNOWN";
         const excluded = !!n.excluded;
+        const syncOn = !!n.sync_running;
 
         return `
           <div class="node ${excluded ? "excluded":""}">
@@ -54,7 +55,10 @@
                 <div class="nodeId">${escapeHtml(n.node_id || "UNKNOWN")}</div>
                 <div class="muted">${escapeHtml(n.peer_addr || "-")}</div>
               </div>
-              <div class="pill ${st.toLowerCase()}">${escapeHtml(st)}</div>
+              <div class="row">
+                <div class="pill ${syncOn ? "healthy" : "warning"}">${syncOn ? "SYNC ON" : "SYNC OFF"}</div>
+                <div class="pill ${st.toLowerCase()}">${escapeHtml(st)}</div>
+              </div>
             </div>
 
             <div class="kpi">
@@ -65,6 +69,7 @@
             </div>
 
             ${excluded ? `<div class="warnBox">Excluded: ${escapeHtml(n.reason || "UNKNOWN")}</div>` : ``}
+            ${(!syncOn && (n.online || st === "PAUSED")) ? `<div class="warnBox">Sync paused: metrics will stop updating.</div>` : ``}
           </div>
         `;
       }
