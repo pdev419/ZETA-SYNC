@@ -2,20 +2,23 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
+import io
+import json
 import os
 import socket
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Iterable, Generator, Tuple
 
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 from fastapi.templating import Jinja2Templates
@@ -108,6 +111,132 @@ def _sha1(s: str) -> str:
 def _ca_fingerprint_sha256_pem(pem: str) -> str:
     b = pem.encode("utf-8")
     return hashlib.sha256(b).hexdigest()
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def iter_jsonl_records(
+    path: Path,
+    *,
+    node_id: Optional[str] = None,
+    after_ts: Optional[float] = None,
+    limit: int = 5000,
+) -> Generator[Dict[str, Any], None, None]:
+    if limit <= 0:
+        return
+    if not path.exists():
+        return
+    count = 0
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if count >= limit:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
+            if not isinstance(obj, dict):
+                continue
+
+            if node_id and str(obj.get("node_id") or "") != node_id:
+                continue
+
+            if after_ts is not None:
+                ts_val = obj.get("ts")
+                if ts_val is None:
+                    continue
+                if _safe_float(ts_val, -1.0) <= float(after_ts):
+                    continue
+
+            yield obj
+            count += 1
+
+
+def _event_sort_key_clockless(ev: Dict[str, Any]) -> Tuple[int, str]:
+    return (_safe_int(ev.get("sequence_id"), -1), str(ev.get("node_id") or ""))
+
+
+def normalize_event_for_export(ev: Dict[str, Any]) -> Dict[str, Any]:
+    core_keys = {"ts", "event_id", "node_id", "sequence_id", "event_type", "severity"}
+    out: Dict[str, Any] = {
+        "ts": ev.get("ts"),
+        "event_id": ev.get("event_id"),
+        "node_id": ev.get("node_id"),
+        "sequence_id": ev.get("sequence_id"),
+        "event_type": ev.get("event_type"),
+        "severity": ev.get("severity"),
+    }
+    extra = {k: v for k, v in ev.items() if k not in core_keys}
+    out["extra"] = extra
+    return out
+
+
+def normalize_metric_for_export(rec: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = rec.get("metrics") if isinstance(rec.get("metrics"), dict) else {}
+    common = ("z", "drift", "stability", "ppm_offset", "rate_hz", "peer_rate_hz", "sequence")
+    out: Dict[str, Any] = {
+        "ts": rec.get("ts"),
+        "node_id": rec.get("node_id"),
+        "sequence_id": rec.get("sequence_id"),
+    }
+    for k in common:
+        if k in metrics:
+            out[k] = metrics.get(k)
+        else:
+            out[k] = None
+
+    metrics_extra = {k: v for k, v in metrics.items() if k not in set(common)}
+    out["metrics_extra"] = metrics_extra
+    return out
+
+
+def stream_json_array(items: Iterable[Dict[str, Any]]) -> Generator[bytes, None, None]:
+    yield b"["
+    first = True
+    for it in items:
+        if not first:
+            yield b","
+        else:
+            first = False
+        yield json.dumps(it, ensure_ascii=False).encode("utf-8")
+    yield b"]"
+
+
+def stream_csv(
+    rows: Iterable[Dict[str, Any]],
+    fieldnames: List[str],
+) -> Generator[bytes, None, None]:
+    """
+    Stream CSV using an in-memory buffer per-row.
+    """
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    yield buf.getvalue().encode("utf-8")
+    buf.seek(0)
+    buf.truncate(0)
+
+    for r in rows:
+        writer.writerow(r)
+        yield buf.getvalue().encode("utf-8")
+        buf.seek(0)
+        buf.truncate(0)
 
 
 @dataclass(frozen=True)
@@ -267,11 +396,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     source_peer = str(meta.get("peer_id") or "")
     peer_listen = msg.get("listen")
     peer_sync_running = msg.get("sync_running")
-    stable_peer_addr = (
-        peer_listen
-        if isinstance(peer_listen, str) and ":" in peer_listen
-        else None
-    )
+    stable_peer_addr = peer_listen if isinstance(peer_listen, str) and ":" in peer_listen else None
 
     if tls_enabled:
         if not peer_node_id:
@@ -385,7 +510,12 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
                 if isinstance(peers, list):
                     ctx.discovery.merge([p for p in peers if isinstance(p, str)])
 
-                await send_message(host, port, {"type": "HELLO", "listen": advertise, "sync_running": bool(ctx.sync_running)}, ssl_ctx=app.state.client_ssl_ctx)
+                await send_message(
+                    host,
+                    port,
+                    {"type": "HELLO", "listen": advertise, "sync_running": bool(ctx.sync_running)},
+                    ssl_ctx=app.state.client_ssl_ctx,
+                )
             except Exception:
                 continue
 
@@ -399,7 +529,12 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
                 if isinstance(peers, list):
                     ctx.discovery.merge([p for p in peers if isinstance(p, str)])
 
-                await send_message(host, port, {"type": "HELLO", "listen": advertise, "sync_running": bool(ctx.sync_running)}, ssl_ctx=app.state.client_ssl_ctx)
+                await send_message(
+                    host,
+                    port,
+                    {"type": "HELLO", "listen": advertise, "sync_running": bool(ctx.sync_running)},
+                    ssl_ctx=app.state.client_ssl_ctx,
+                )
             except Exception:
                 continue
 
@@ -773,7 +908,9 @@ def create_app() -> FastAPI:
             known = set([m.get("peer_addr") for m in nodes if m.get("peer_addr")])
             for p in sorted(app.state.ctx.discovery.known_peers):
                 if p not in known:
-                    nodes.append({"node_id": None, "peer_addr": p, "state": "UNKNOWN", "online": False, "sync_running": False, "excluded": False, "reason": None, "metrics": {}})
+                    nodes.append(
+                        {"node_id": None, "peer_addr": p, "state": "UNKNOWN", "online": False, "sync_running": False, "excluded": False, "reason": None, "metrics": {}}
+                    )
         return {"nodes": nodes, "cluster": app.state.membership.export_cluster()}
 
     @app.get("/api/v1/cluster/events")
@@ -820,6 +957,97 @@ def create_app() -> FastAPI:
             "healthy_required": c["healthy_required"],
             "rule": "HEALTHY when quorum met + no exclusions + stability >= threshold for N consecutive ticks",
         }
+
+    @app.get("/api/v1/export/events.json")
+    async def export_events_json(
+        node_id: Optional[str] = Query(None),
+        after_ts: Optional[float] = Query(None),
+        limit: int = Query(5000, ge=1, le=100000),
+    ):
+        def _items():
+            items = iter_jsonl_records(EVENTS_LOG, node_id=node_id, after_ts=after_ts, limit=limit)
+            buf = list(items)
+            buf.sort(key=_event_sort_key_clockless, reverse=True)
+            for ev in buf:
+                yield normalize_event_for_export(ev)
+
+        headers = {"Content-Disposition": 'attachment; filename="zeta_events.json"'}
+        return StreamingResponse(stream_json_array(_items()), media_type="application/json", headers=headers)
+
+    @app.get("/api/v1/export/events.csv")
+    async def export_events_csv(
+        node_id: Optional[str] = Query(None),
+        after_ts: Optional[float] = Query(None),
+        limit: int = Query(5000, ge=1, le=100000),
+    ):
+        def _rows():
+            buf = list(iter_jsonl_records(EVENTS_LOG, node_id=node_id, after_ts=after_ts, limit=limit))
+            buf.sort(key=_event_sort_key_clockless, reverse=True)
+            for ev in buf:
+                n = normalize_event_for_export(ev)
+                yield {
+                    "node_id": n.get("node_id"),
+                    "sequence_id": n.get("sequence_id"),
+                    "event_id": n.get("event_id"),
+                    "event_type": n.get("event_type"),
+                    "severity": n.get("severity"),
+                    "debug_ts": n.get("ts"),
+                    "extra_json": json.dumps(n.get("extra") or {}, ensure_ascii=False),
+                }
+
+        fieldnames = ["node_id", "sequence_id", "event_id", "event_type", "severity", "debug_ts", "extra_json"]
+        headers = {"Content-Disposition": 'attachment; filename="zeta_events.csv"'}
+        return StreamingResponse(stream_csv(_rows(), fieldnames), media_type="text/csv; charset=utf-8", headers=headers)
+
+    @app.get("/api/v1/export/metrics.json")
+    async def export_metrics_json(
+        node_id: Optional[str] = Query(None),
+        after_ts: Optional[float] = Query(None),
+        limit: int = Query(5000, ge=1, le=100000),
+    ):
+        def _items():
+            for rec in iter_jsonl_records(METRICS_LOG, node_id=node_id, after_ts=after_ts, limit=limit):
+                yield normalize_metric_for_export(rec)
+
+        headers = {"Content-Disposition": 'attachment; filename="zeta_metrics.json"'}
+        return StreamingResponse(stream_json_array(_items()), media_type="application/json", headers=headers)
+
+    @app.get("/api/v1/export/metrics.csv")
+    async def export_metrics_csv(
+        node_id: Optional[str] = Query(None),
+        after_ts: Optional[float] = Query(None),
+        limit: int = Query(5000, ge=1, le=100000),
+    ):
+        def _rows():
+            for rec in iter_jsonl_records(METRICS_LOG, node_id=node_id, after_ts=after_ts, limit=limit):
+                n = normalize_metric_for_export(rec)
+                yield {
+                    "node_id": n.get("node_id"),
+                    "sequence_id": n.get("sequence_id"),
+                    "debug_ts": n.get("ts"),
+                    "z": n.get("z"),
+                    "drift": n.get("drift"),
+                    "stability": n.get("stability"),
+                    "ppm_offset": n.get("ppm_offset"),
+                    "rate_hz": n.get("rate_hz"),
+                    "peer_rate_hz": n.get("peer_rate_hz"),
+                    "metrics_extra_json": json.dumps(n.get("metrics_extra") or {}, ensure_ascii=False),
+                }
+
+        fieldnames = [
+            "node_id",
+            "sequence_id",
+            "debug_ts",
+            "z",
+            "drift",
+            "stability",
+            "ppm_offset",
+            "rate_hz",
+            "peer_rate_hz",
+            "metrics_extra_json",
+        ]
+        headers = {"Content-Disposition": 'attachment; filename="zeta_metrics.csv"'}
+        return StreamingResponse(stream_csv(_rows(), fieldnames), media_type="text/csv; charset=utf-8", headers=headers)
 
     return app
 

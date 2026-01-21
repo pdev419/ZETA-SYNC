@@ -24,11 +24,26 @@
         <div class="row spread">
           <div>
             <h2 style="margin:0">Event Log</h2>
+            <div class="muted small" style="margin-top:4px">
+              Ordering is by <b>node_id + sequence_id</b>. Timestamps are <b>debug-only</b>.
+            </div>
           </div>
-          <div class="row">
+
+          <div class="row" style="flex-wrap: wrap; gap: 8px; justify-content: flex-end;">
+            <a class="btn" href="/api/v1/export/events.csv" download>Events CSV</a>
+            <a class="btn" href="/api/v1/export/events.json" download>Events JSON</a>
+            <a class="btn" href="/api/v1/export/metrics.csv" download>Metrics CSV</a>
+            <a class="btn" href="/api/v1/export/metrics.json" download>Metrics JSON</a>
+
             <button class="btn" onclick="loadEvents(true)">Refresh</button>
-            <button class="btn warn" onclick="toggleAutoRefresh()"><span id="autoBtn">Pause</span> auto</button>
+            <button class="btn warn" onclick="toggleAutoRefresh()">
+              <span id="autoBtn">Pause</span> auto
+            </button>
           </div>
+        </div>
+
+        <div id="autoPausedHint" class="muted small" style="display:none; margin-top:10px">
+          Auto-refresh paused while Details is open. Close all Details to resume.
         </div>
 
         <div id="eventsList"></div>
@@ -56,19 +71,32 @@
         } else {
           if(timer) clearInterval(timer);
           timer = null;
+          document.getElementById("autoPausedHint").style.display = "none";
         }
+      }
+
+      function anyDetailsOpen(){
+        return document.querySelector("details.evDetails[open]") !== null;
       }
 
       function schedule(){
         if(timer) return;
         timer = setInterval(() => {
           if(!autoOn) return;
+
+          if(anyDetailsOpen()){
+            document.getElementById("autoPausedHint").style.display = "block";
+            return;
+          } else {
+            document.getElementById("autoPausedHint").style.display = "none";
+          }
+
           loadEvents(false);
         }, 2000);
       }
 
       function eventKey(ev){
-        return ev.event_id || (String(ev.node_id||"") + ":" + String(ev.sequence_id||"") + ":" + String(ev.ts||""));
+        return ev.event_id || (String(ev.node_id||"") + ":" + String(ev.sequence_id||""));
       }
 
       function fmtTs(ts){
@@ -87,7 +115,8 @@
         const pillCls = (sev === "ERROR") ? "error" : (sev === "WARNING" ? "warning" : "info");
 
         const title = `${escapeHtml(ev.event_type || "EVENT")} · ${escapeHtml(sev)}`;
-        const metaLine = `node=${escapeHtml(ev.node_id || "-")} · seq=${escapeHtml(ev.sequence_id ?? "-")} · debug_ts=${escapeHtml(fmtTs(ev.ts))}`;
+        const metaLine =
+          `node=${escapeHtml(ev.node_id || "-")} · seq=${escapeHtml(ev.sequence_id ?? "-")} · debug_ts=${escapeHtml(fmtTs(ev.ts))}`;
 
         const raw = JSON.stringify(ev, null, 2);
 
@@ -128,6 +157,11 @@
             if(!kk) return;
             if(d.open) expanded.add(kk);
             else expanded.delete(kk);
+            if(anyDetailsOpen() && autoOn){
+              document.getElementById("autoPausedHint").style.display = "block";
+            } else {
+              document.getElementById("autoPausedHint").style.display = "none";
+            }
           }, { passive: true });
         });
       }
@@ -135,12 +169,18 @@
       let lastPayloadHash = "";
 
       async function loadEvents(force){
+        if(!force && anyDetailsOpen()){
+          if(autoOn) document.getElementById("autoPausedHint").style.display = "block";
+          return;
+        }
+
         captureExpanded();
 
         const res = await fetch("/api/v1/cluster/events?limit=200").then(r => r.json());
         const events = res.events || [];
 
-        const payloadHash = JSON.stringify(events.map(e => e.event_id || e.sequence_id || e.ts || "")).slice(0, 2000);
+        // Only re-render if event identities changed (prevents unnecessary DOM churn)
+        const payloadHash = JSON.stringify(events.map(e => e.event_id || (String(e.node_id||"") + ":" + String(e.sequence_id||"")))).slice(0, 2000);
         if(!force && payloadHash === lastPayloadHash){
           document.getElementById("rawEvents").textContent = JSON.stringify(res, null, 2);
           return;
@@ -152,6 +192,12 @@
         document.getElementById("rawEvents").textContent = JSON.stringify(res, null, 2);
 
         restoreExpanded();
+
+        if(anyDetailsOpen() && autoOn){
+          document.getElementById("autoPausedHint").style.display = "block";
+        } else {
+          document.getElementById("autoPausedHint").style.display = "none";
+        }
       }
 
       loadEvents(true);
