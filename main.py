@@ -366,7 +366,7 @@ class NodeRuntime:
         self.sync_running = False
         self.sync_last_change_ts = time.time()
 
-    def sync_running(self) -> bool:
+    def is_sync_running(self) -> bool:
         if not self.zeta_proc:
             return False
         try:
@@ -894,7 +894,7 @@ def create_app() -> FastAPI:
     async def api_cluster_status():
         base = app.state.ctx.cluster_status()
         base["cluster"] = app.state.membership.export_cluster()
-        base["sync_running"] = bool(app.state.ctx.sync_running())
+        base["sync_running"] = bool(app.state.ctx.is_sync_running())
         return base
 
     @app.get("/api/v1/cluster/health")
