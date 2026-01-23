@@ -2,23 +2,26 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
+import io
+import json
 import os
 import socket
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.requests import Request
 from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
 
 from node.agent.discovery import Discovery, parse_hostport
 from node.cluster.membership import MembershipTracker
@@ -153,10 +156,12 @@ class NodeRuntime:
     excluded_nodes: Set[str] = field(default_factory=set)
     local_seq: int = 0
     zeta_proc: Optional[ZetaSyncProcess] = None
+
     sync_running: bool = False
     sync_last_change_ts: float = field(default_factory=lambda: time.time())
 
     _event_throttle: Dict[str, float] = field(default_factory=dict)
+    _control_nonce_seen: Dict[str, float] = field(default_factory=dict)
 
     def advertise_addr(self) -> str:
         return self.self_advertise_addr
@@ -175,7 +180,7 @@ class NodeRuntime:
         append_jsonl(
             EVENTS_LOG,
             {
-                "ts": time.time(),
+                "ts": time.time(),  # debug-only
                 "event_id": eid,
                 "node_id": self.node_id,
                 "sequence_id": seq,
@@ -185,7 +190,14 @@ class NodeRuntime:
             },
         )
 
-    def log_event_throttled(self, throttle_key: str, min_interval_sec: float, event_type: str, severity: str = "INFO", **extra: Any) -> None:
+    def log_event_throttled(
+        self,
+        throttle_key: str,
+        min_interval_sec: float,
+        event_type: str,
+        severity: str = "INFO",
+        **extra: Any,
+    ) -> None:
         now = time.time()
         last = self._event_throttle.get(throttle_key, 0.0)
         if now - last < min_interval_sec:
@@ -202,7 +214,7 @@ class NodeRuntime:
             workdir0 = str((PROJECT_ROOT / workdir0).resolve())
         return cmd0, workdir0
 
-    async def start_sync(self) -> None:
+    async def start_sync_local(self) -> None:
         if self.zeta_proc is None:
             cmd0, workdir0 = self._resolve_cmd_workdir()
             cmd = [cmd0] + self.settings.zeta_sync_args
@@ -212,26 +224,24 @@ class NodeRuntime:
             await self.zeta_proc.start()
         except FileNotFoundError as e:
             self.log_event("SYNC_START_FAILED", severity="ERROR", reason="FILE_NOT_FOUND", detail=str(e))
-            raise RuntimeError(
-                f"ZETA_SYNC_CMD not found. Check .env ZETA_SYNC_CMD='{self.settings.zeta_sync_cmd}'."
-            ) from e
+            raise RuntimeError(f"ZETA_SYNC_CMD not found. Check .env ZETA_SYNC_CMD='{self.settings.zeta_sync_cmd}'.") from e
         except PermissionError as e:
             self.log_event("SYNC_START_FAILED", severity="ERROR", reason="PERMISSION_DENIED", detail=str(e))
-            raise RuntimeError(
-                f"ZETA_SYNC_CMD not executable. chmod +x '{self.settings.zeta_sync_cmd}'."
-            ) from e
+            raise RuntimeError(f"ZETA_SYNC_CMD not executable. chmod +x '{self.settings.zeta_sync_cmd}'.") from e
 
-        self.log_event("SYNC_STARTED", cmd=[self.settings.zeta_sync_cmd] + self.settings.zeta_sync_args)
         self.sync_running = True
         self.sync_last_change_ts = time.time()
+        self.log_event("SYNC_STARTED", cmd=[self.settings.zeta_sync_cmd] + self.settings.zeta_sync_args)
 
-    async def stop_sync(self) -> None:
+    async def stop_sync_local(self) -> None:
         if self.zeta_proc:
             await self.zeta_proc.stop()
         self.zeta_proc = None
-        self.log_event("SYNC_STOPPED")
+
         self.sync_running = False
         self.sync_last_change_ts = time.time()
+
+        self.log_event("SYNC_STOPPED")
 
     def learn_peer_identity(self, peer_addr: str, node_id: str) -> None:
         if not peer_addr or not node_id:
@@ -255,6 +265,35 @@ class NodeRuntime:
         }
 
 
+async def _broadcast_control(app: FastAPI, ctx: NodeRuntime, action: str) -> Dict[str, Any]:
+    nonce = _sha1(f"{ctx.node_id}:{ctx.next_seq()}:{time.time()}")
+    payload = {
+        "type": "SYNC_CONTROL",
+        "action": action,
+        "nonce": nonce,
+        "from": ctx.node_id,
+        "listen": ctx.advertise_addr(),
+        "sync_running": bool(ctx.sync_running),
+        "sent_at": time.time(),
+    }
+
+    ok: List[str] = []
+    fail: List[Dict[str, Any]] = []
+
+    for peer in list(ctx.discovery.known_peers):
+        try:
+            host, port = parse_hostport(peer)
+            resp = await send_message(host, port, payload, timeout=2.5, ssl_ctx=app.state.client_ssl_ctx)
+            if resp.get("ok"):
+                ok.append(peer)
+            else:
+                fail.append({"peer": peer, "resp": resp})
+        except Exception as e:
+            fail.append({"peer": peer, "error": str(e)})
+
+    return {"nonce": nonce, "ok_peers": ok, "fail_peers": fail}
+
+
 async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) -> dict:
     t = msg.get("type")
 
@@ -267,11 +306,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
     source_peer = str(meta.get("peer_id") or "")
     peer_listen = msg.get("listen")
     peer_sync_running = msg.get("sync_running")
-    stable_peer_addr = (
-        peer_listen
-        if isinstance(peer_listen, str) and ":" in peer_listen
-        else None
-    )
+    stable_peer_addr = peer_listen if isinstance(peer_listen, str) and ":" in peer_listen else None
 
     if tls_enabled:
         if not peer_node_id:
@@ -307,11 +342,14 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
                     },
                 )
                 ctx.log_event("NODE_JOIN_REQUESTED", severity="WARNING", reason_code="not_allowlisted", source_node_id=peer_node_id, source_peer=source_peer)
-
             return {"type": "ERROR", "reason": "pending_approval"}
 
     if peer_node_id and stable_peer_addr:
-        app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr, sync_running=peer_sync_running)
+        app.state.membership.observe(
+            peer_node_id,
+            peer_addr=stable_peer_addr,
+            sync_running=bool(peer_sync_running) if peer_sync_running is not None else None,
+        )
 
     if t == "PING":
         return {"type": "PONG", "from": ctx.node_id}
@@ -321,7 +359,7 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
             ctx.discovery.merge([peer_listen])
             if tls_enabled and peer_node_id and stable_peer_addr:
                 ctx.learn_peer_identity(peer_listen, peer_node_id)
-                app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr, sync_running=peer_sync_running)
+                app.state.membership.observe(peer_node_id, peer_addr=stable_peer_addr, sync_running=bool(peer_sync_running))
         return {"type": "HELLO_ACK", "from": ctx.node_id, "peers": sorted(ctx.discovery.known_peers)}
 
     if t == "PEER_LIST_REQ":
@@ -339,8 +377,50 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
         sr = msg.get("sync_running")
         if isinstance(sender, str) and isinstance(metrics, dict) and stable_peer_addr:
             ctx.upsert_peer_metrics(sender, metrics)
-            app.state.membership.observe(sender, peer_addr=stable_peer_addr, metrics=metrics, sync_running=sr)
-        return {"type": "METRICS_ACK"}
+            app.state.membership.observe(
+                sender,
+                peer_addr=stable_peer_addr,
+                metrics=metrics,
+                sync_running=bool(sr) if sr is not None else None,
+            )
+        return {"type": "METRICS_ACK", "ok": True}
+
+    if t == "SYNC_CONTROL":
+        action = str(msg.get("action") or "").upper()
+        nonce = str(msg.get("nonce") or "")
+        frm = str(msg.get("from") or "unknown")
+
+        if nonce:
+            now = time.time()
+            for k, ts in list(ctx._control_nonce_seen.items()):
+                if now - ts > 60:
+                    ctx._control_nonce_seen.pop(k, None)
+            if nonce in ctx._control_nonce_seen:
+                return {"type": "SYNC_CONTROL_ACK", "ok": True, "dedup": True}
+
+            ctx._control_nonce_seen[nonce] = now
+
+        if action == "START":
+            try:
+                await ctx.start_sync_local()
+                app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), sync_running=True, sync_last_change_ts=ctx.sync_last_change_ts)
+                ctx.log_event("CLUSTER_SYNC_START_APPLIED", severity="WARNING", from_node=frm, nonce=nonce)
+                return {"type": "SYNC_CONTROL_ACK", "ok": True, "applied": "START"}
+            except Exception as e:
+                ctx.log_event("CLUSTER_SYNC_START_FAILED", severity="ERROR", from_node=frm, nonce=nonce, detail=str(e))
+                return {"type": "SYNC_CONTROL_ACK", "ok": False, "error": str(e)}
+
+        if action == "STOP":
+            try:
+                await ctx.stop_sync_local()
+                app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), sync_running=False, sync_last_change_ts=ctx.sync_last_change_ts)
+                ctx.log_event("CLUSTER_SYNC_STOP_APPLIED", severity="WARNING", from_node=frm, nonce=nonce)
+                return {"type": "SYNC_CONTROL_ACK", "ok": True, "applied": "STOP"}
+            except Exception as e:
+                ctx.log_event("CLUSTER_SYNC_STOP_FAILED", severity="ERROR", from_node=frm, nonce=nonce, detail=str(e))
+                return {"type": "SYNC_CONTROL_ACK", "ok": False, "error": str(e)}
+
+        return {"type": "SYNC_CONTROL_ACK", "ok": False, "error": f"unknown action {action}"}
 
     return {"type": "ERROR", "reason": f"Unknown type {t}"}
 
@@ -358,11 +438,16 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
                 if isinstance(peers, list):
                     ctx.discovery.merge([p for p in peers if isinstance(p, str)])
 
-                await send_message(host, port, {"type": "HELLO", "listen": advertise, "sync_running": bool(ctx.sync_running)}, ssl_ctx=app.state.client_ssl_ctx)
+                await send_message(
+                    host,
+                    port,
+                    {"type": "HELLO", "listen": advertise, "sync_running": bool(ctx.sync_running)},
+                    ssl_ctx=app.state.client_ssl_ctx,
+                )
             except Exception:
                 continue
 
-        targets = ctx.discovery.pick_targets(k=2)
+        targets = ctx.discovery.pick_targets(k=3)
         payload = {"type": "GOSSIP", "peers": sorted(ctx.discovery.known_peers)}
         for tgt in targets:
             try:
@@ -372,7 +457,12 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
                 if isinstance(peers, list):
                     ctx.discovery.merge([p for p in peers if isinstance(p, str)])
 
-                await send_message(host, port, {"type": "HELLO", "listen": advertise, "sync_running": bool(ctx.sync_running)}, ssl_ctx=app.state.client_ssl_ctx)
+                await send_message(
+                    host,
+                    port,
+                    {"type": "HELLO", "listen": advertise, "sync_running": bool(ctx.sync_running)},
+                    ssl_ctx=app.state.client_ssl_ctx,
+                )
             except Exception:
                 continue
 
@@ -382,12 +472,12 @@ async def discovery_loop(ctx: NodeRuntime, app: FastAPI) -> None:
 async def metrics_loop(ctx: NodeRuntime, app: FastAPI) -> None:
     while True:
         if not ctx.zeta_proc:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
             continue
 
         st = ctx.zeta_proc.status()
         if not st.running:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
             continue
 
         async for line in ctx.zeta_proc.stdout_lines():
@@ -396,15 +486,25 @@ async def metrics_loop(ctx: NodeRuntime, app: FastAPI) -> None:
                 ctx.upsert_peer_metrics(ctx.node_id, parsed)
 
                 ctx.sync_running = True
+
                 app.state.membership.observe(
                     ctx.node_id,
                     peer_addr=ctx.advertise_addr(),
                     metrics=parsed,
                     sync_running=True,
+                    sync_last_change_ts=ctx.sync_last_change_ts,
                 )
 
                 if has_min_disk_free(LOG_DIR):
-                    append_jsonl(METRICS_LOG, {"ts": time.time(), "node_id": ctx.node_id, "sequence_id": ctx.next_seq(), "metrics": parsed})
+                    append_jsonl(
+                        METRICS_LOG,
+                        {
+                            "ts": time.time(),
+                            "node_id": ctx.node_id,
+                            "sequence_id": ctx.next_seq(),
+                            "metrics": parsed,
+                        },
+                    )
 
         await asyncio.sleep(0.2)
 
@@ -513,7 +613,7 @@ def create_app() -> FastAPI:
         healthy_consecutive=int(os.getenv("HEALTHY_CONSECUTIVE_TICKS", "10")),
     )
 
-    app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={}, sync_running=False)
+    app.state.membership.observe(ctx.node_id, peer_addr=ctx.advertise_addr(), metrics={}, sync_running=False, sync_last_change_ts=ctx.sync_last_change_ts)
 
     store = SecurityStore(SECURITY_JSON)
     app.state.security_store = store
@@ -568,6 +668,7 @@ def create_app() -> FastAPI:
 
     app.router.lifespan_context = lifespan
 
+    # ---------------- UI Routes ----------------
     @app.get("/", response_class=HTMLResponse)
     async def ui_index(request: Request):
         return templates.TemplateResponse("index.html", {"request": request})
@@ -587,17 +688,23 @@ def create_app() -> FastAPI:
     @app.post("/mgmt/cluster/start")
     async def mgmt_start():
         try:
-            await app.state.ctx.start_sync()
-            app.state.membership.observe(app.state.ctx.node_id, peer_addr=app.state.ctx.advertise_addr(), sync_running=True)
-            return {"ok": True}
+            await app.state.ctx.start_sync_local()
+            app.state.membership.observe(app.state.ctx.node_id, peer_addr=app.state.ctx.advertise_addr(), sync_running=True, sync_last_change_ts=app.state.ctx.sync_last_change_ts)
+
+            b = await _broadcast_control(app, app.state.ctx, action="START")
+            app.state.ctx.log_event("CLUSTER_SYNC_START_BROADCAST", severity="WARNING", **b)
+            return {"ok": True, "broadcast": b}
         except RuntimeError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/mgmt/cluster/stop")
     async def mgmt_stop():
-        await app.state.ctx.stop_sync()
-        app.state.membership.observe(app.state.ctx.node_id, peer_addr=app.state.ctx.advertise_addr(), sync_running=False)
-        return {"ok": True}
+        await app.state.ctx.stop_sync_local()
+        app.state.membership.observe(app.state.ctx.node_id, peer_addr=app.state.ctx.advertise_addr(), sync_running=False, sync_last_change_ts=app.state.ctx.sync_last_change_ts)
+
+        b = await _broadcast_control(app, app.state.ctx, action="STOP")
+        app.state.ctx.log_event("CLUSTER_SYNC_STOP_BROADCAST", severity="WARNING", **b)
+        return {"ok": True, "broadcast": b}
 
     @app.post("/mgmt/security/ca/init")
     async def mgmt_ca_init():
@@ -748,7 +855,18 @@ def create_app() -> FastAPI:
             known = set([m.get("peer_addr") for m in nodes if m.get("peer_addr")])
             for p in sorted(app.state.ctx.discovery.known_peers):
                 if p not in known:
-                    nodes.append({"node_id": None, "peer_addr": p, "state": "UNKNOWN", "online": False, "sync_running": False, "excluded": False, "reason": None, "metrics": {}})
+                    nodes.append(
+                        {
+                            "node_id": None,
+                            "peer_addr": p,
+                            "state": "UNKNOWN",
+                            "online": False,
+                            "sync_running": False,
+                            "excluded": False,
+                            "reason": None,
+                            "metrics": {},
+                        }
+                    )
         return {"nodes": nodes, "cluster": app.state.membership.export_cluster()}
 
     @app.get("/api/v1/cluster/events")
@@ -763,12 +881,12 @@ def create_app() -> FastAPI:
 
         ev_sorted = sorted(
             ev,
-            key=lambda x: (seq(x.get("sequence_id")), str(x.get("node_id") or "")),
+            key=lambda x: (str(x.get("node_id") or ""), seq(x.get("sequence_id"))),
             reverse=True,
         )
 
         return {
-            "ordering": "sequence_id_desc_then_node_id",
+            "ordering": "node_id_desc_then_sequence_id_desc",
             "note": "ts is local debug timestamp only; not used for ordering",
             "events": ev_sorted,
         }
@@ -793,8 +911,82 @@ def create_app() -> FastAPI:
             "quorum_needed": c["quorum_needed"],
             "healthy_stability_threshold": c["healthy_stability_threshold"],
             "healthy_required": c["healthy_required"],
-            "rule": "HEALTHY when quorum met + no exclusions + stability >= threshold for N consecutive ticks",
+            "rule": "HEALTHY requires all expected nodes ACTIVE + stable streak; JOINING/PAUSED not counted",
         }
+
+    def _download_name(prefix: str, ext: str) -> str:
+        return f"{prefix}.{ext}"
+
+    @app.get("/api/v1/export/events.json")
+    async def export_events_json(limit: int = 100000):
+        ev = tail_jsonl(EVENTS_LOG, limit=min(max(1, limit), 200000))
+        return JSONResponse(content={"events": ev, "note": "ts is debug-only; ordering should use node_id+sequence_id"})
+
+    @app.get("/api/v1/export/events.csv")
+    async def export_events_csv(limit: int = 100000):
+        ev = tail_jsonl(EVENTS_LOG, limit=min(max(1, limit), 200000))
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["event_id", "node_id", "sequence_id", "event_type", "severity", "debug_ts", "extra_json"])
+
+        for e in ev:
+            base = {
+                "event_id": e.get("event_id"),
+                "node_id": e.get("node_id"),
+                "sequence_id": e.get("sequence_id"),
+                "event_type": e.get("event_type"),
+                "severity": e.get("severity"),
+                "debug_ts": e.get("ts"),
+            }
+            extra = {k: v for k, v in e.items() if k not in base}
+            w.writerow([base["event_id"], base["node_id"], base["sequence_id"], base["event_type"], base["severity"], base["debug_ts"], json.dumps(extra, separators=(",", ":"))])
+
+        data = buf.getvalue().encode("utf-8")
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{_download_name("events", "csv")}"'},
+        )
+
+    @app.get("/api/v1/export/metrics.json")
+    async def export_metrics_json(limit: int = 200000):
+        rows = tail_jsonl(METRICS_LOG, limit=min(max(1, limit), 500000))
+        return JSONResponse(content={"metrics": rows, "note": "ts is debug-only; primary correlation uses node_id+sequence_id"})
+
+    @app.get("/api/v1/export/metrics.csv")
+    async def export_metrics_csv(limit: int = 200000):
+        rows = tail_jsonl(METRICS_LOG, limit=min(max(1, limit), 500000))
+
+        keys: Set[str] = set()
+        for r in rows:
+            m = r.get("metrics") or {}
+            if isinstance(m, dict):
+                for k in m.keys():
+                    keys.add(str(k))
+        metric_cols = sorted(keys)
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["node_id", "sequence_id", "debug_ts"] + metric_cols)
+
+        for r in rows:
+            node_id_ = r.get("node_id")
+            seq_ = r.get("sequence_id")
+            ts_ = r.get("ts")
+            m = r.get("metrics") or {}
+            row = [node_id_, seq_, ts_]
+            for k in metric_cols:
+                v = m.get(k) if isinstance(m, dict) else None
+                row.append(v)
+            w.writerow(row)
+
+        data = buf.getvalue().encode("utf-8")
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{_download_name("metrics", "csv")}"'},
+        )
 
     return app
 
