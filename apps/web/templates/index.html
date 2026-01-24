@@ -72,8 +72,8 @@
         document.getElementById("rawStatus").textContent = JSON.stringify(st, null, 2);
       }
 
-      async function clusterStart(){ document.getElementById("controlOut").textContent = JSON.stringify(await apiCall("POST","/mgmt/cluster/start"),null,2);}
-      async function clusterStop(){ document.getElementById("controlOut").textContent = JSON.stringify(await apiCall("POST","/mgmt/cluster/stop"),null,2);}
+      async function clusterStart(){ document.getElementById("controlOut").textContent = JSON.stringify(await apiCall("POST","/mgmt/node/start"),null,2);}
+      async function clusterStop(){ document.getElementById("controlOut").textContent = JSON.stringify(await apiCall("POST","/mgmt/node/stop"),null,2);}
       async function restartService(){ document.getElementById("controlOut").textContent = JSON.stringify(await apiCall("POST","/mgmt/system/restart"),null,2);}
 
       loadHome();

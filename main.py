@@ -668,7 +668,6 @@ def create_app() -> FastAPI:
 
     app.router.lifespan_context = lifespan
 
-    # ---------------- UI Routes ----------------
     @app.get("/", response_class=HTMLResponse)
     async def ui_index(request: Request):
         return templates.TemplateResponse("index.html", {"request": request})
@@ -705,6 +704,33 @@ def create_app() -> FastAPI:
         b = await _broadcast_control(app, app.state.ctx, action="STOP")
         app.state.ctx.log_event("CLUSTER_SYNC_STOP_BROADCAST", severity="WARNING", **b)
         return {"ok": True, "broadcast": b}
+
+    @app.post("/mgmt/node/start")
+    async def mgmt_node_start():
+        try:
+            await app.state.ctx.start_sync_local()
+            app.state.membership.observe(
+                app.state.ctx.node_id,
+                peer_addr=app.state.ctx.advertise_addr(),
+                sync_running=True,
+                sync_last_change_ts=app.state.ctx.sync_last_change_ts,
+            )
+            app.state.ctx.log_event("NODE_SYNC_STARTED_LOCAL", severity="WARNING")
+            return {"ok": True, "scope": "node"}
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/mgmt/node/stop")
+    async def mgmt_node_stop():
+        await app.state.ctx.stop_sync_local()
+        app.state.membership.observe(
+            app.state.ctx.node_id,
+            peer_addr=app.state.ctx.advertise_addr(),
+            sync_running=False,
+            sync_last_change_ts=app.state.ctx.sync_last_change_ts,
+        )
+        app.state.ctx.log_event("NODE_SYNC_STOPPED_LOCAL", severity="WARNING")
+        return {"ok": True, "scope": "node"}
 
     @app.post("/mgmt/security/ca/init")
     async def mgmt_ca_init():
