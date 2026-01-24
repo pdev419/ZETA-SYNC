@@ -81,9 +81,6 @@
                 <div class="muted">${escapeHtml(n.peer_addr || "-")}</div>
                 <div class="small muted">Last seen: ${escapeHtml(ago(n.last_seen))}</div>
               </div>
-              <div class="row" style="justify-content:flex-end">
-                ${syncPill(n)}
-              </div>
               <div class="row">
                 <div class="pill ${syncOn ? "healthy" : "warning"}">${syncOn ? "SYNC ON" : "SYNC OFF"}</div>
                 <div class="pill ${st.toLowerCase()}">${escapeHtml(st)}</div>
