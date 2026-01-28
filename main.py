@@ -25,7 +25,7 @@ from starlette.requests import Request
 
 from node.agent.discovery import Discovery, parse_hostport
 from node.cluster.membership import MembershipTracker
-from node.constants import ENV_FILE, EVENTS_LOG, LOG_DIR, METRICS_LOG, PROJECT_ROOT
+from node.constants import CLUSTER_LOG, ENV_FILE, EVENTS_LOG, LOG_DIR, METRICS_LOG, PROJECT_ROOT
 from node.peer.client import send_message
 from node.peer.server import PeerServer
 from node.peer.tls import TLSPaths, build_client_ssl_context, build_server_ssl_context
@@ -113,6 +113,19 @@ def _ca_fingerprint_sha256_pem(pem: str) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def _sync_state_from(m_state: Optional[str], sync_running: Optional[bool]) -> str:
+    st = (m_state or "").upper()
+    if st == "PAUSED":
+        return "PAUSED"
+    if sync_running is False:
+        return "OFF"
+    if st in ("DISCOVERING", "JOINING"):
+        return "JOINING"
+    if sync_running is True:
+        return "ON"
+    return "UNKNOWN"
+
+
 @dataclass(frozen=True)
 class Settings:
     http_host: str
@@ -155,6 +168,8 @@ class NodeRuntime:
 
     excluded_nodes: Set[str] = field(default_factory=set)
     local_seq: int = 0
+    sample_seq_by_node: Dict[str, int] = field(default_factory=dict)
+    cluster_sample_seq: int = 0
     zeta_proc: Optional[ZetaSyncProcess] = None
 
     sync_running: bool = False
@@ -169,6 +184,15 @@ class NodeRuntime:
     def next_seq(self) -> int:
         self.local_seq += 1
         return self.local_seq
+
+    def next_sample_seq(self, node_id: str) -> int:
+        cur = self.sample_seq_by_node.get(node_id, 0) + 1
+        self.sample_seq_by_node[node_id] = cur
+        return cur
+
+    def next_cluster_sample_seq(self) -> int:
+        self.cluster_sample_seq += 1
+        return self.cluster_sample_seq
 
     def log_event(self, event_type: str, severity: str = "INFO", **extra: Any) -> None:
         if not has_min_disk_free(LOG_DIR):
@@ -377,12 +401,39 @@ async def peer_handler(ctx: NodeRuntime, msg: dict, meta: dict, app: FastAPI) ->
         sr = msg.get("sync_running")
         if isinstance(sender, str) and isinstance(metrics, dict) and stable_peer_addr:
             ctx.upsert_peer_metrics(sender, metrics)
-            app.state.membership.observe(
+            m = app.state.membership.observe(
                 sender,
                 peer_addr=stable_peer_addr,
                 metrics=metrics,
                 sync_running=bool(sr) if sr is not None else None,
             )
+            if has_min_disk_free(LOG_DIR):
+                cluster = app.state.membership.export_cluster()
+                sample_seq = ctx.next_sample_seq(sender)
+                sync_running = bool(sr) if sr is not None else None
+                append_jsonl(
+                    METRICS_LOG,
+                    {
+                        "ts": time.time(),
+                        "node_id": sender,
+                        "peer_addr": stable_peer_addr,
+                        "sample_seq": sample_seq,
+                        "metrics": metrics,
+                        "sync_running": sync_running,
+                        "state": m.state,
+                        "sync_state": _sync_state_from(m.state, sync_running),
+                        "cluster_health": cluster.get("cluster_health"),
+                        "active_nodes": cluster.get("active_nodes"),
+                        "expected_nodes": cluster.get("expected_nodes"),
+                        "quorum": cluster.get("quorum"),
+                        "quorum_active": cluster.get("active_nodes"),
+                        "quorum_expected": cluster.get("expected_nodes"),
+                        "quorum_needed": cluster.get("quorum_needed"),
+                        "excluded_nodes": cluster.get("excluded_nodes"),
+                        "reference_z": cluster.get("reference_z"),
+                        "reference_method": cluster.get("reference_method"),
+                    },
+                )
         return {"type": "METRICS_ACK", "ok": True}
 
     if t == "SYNC_CONTROL":
@@ -487,7 +538,7 @@ async def metrics_loop(ctx: NodeRuntime, app: FastAPI) -> None:
 
                 ctx.sync_running = True
 
-                app.state.membership.observe(
+                m = app.state.membership.observe(
                     ctx.node_id,
                     peer_addr=ctx.advertise_addr(),
                     metrics=parsed,
@@ -496,13 +547,29 @@ async def metrics_loop(ctx: NodeRuntime, app: FastAPI) -> None:
                 )
 
                 if has_min_disk_free(LOG_DIR):
+                    cluster = app.state.membership.export_cluster()
+                    sample_seq = ctx.next_sample_seq(ctx.node_id)
                     append_jsonl(
                         METRICS_LOG,
                         {
                             "ts": time.time(),
                             "node_id": ctx.node_id,
-                            "sequence_id": ctx.next_seq(),
+                            "peer_addr": ctx.advertise_addr(),
+                            "sample_seq": sample_seq,
                             "metrics": parsed,
+                            "sync_running": True,
+                            "state": m.state,
+                            "sync_state": _sync_state_from(m.state, True),
+                            "cluster_health": cluster.get("cluster_health"),
+                            "active_nodes": cluster.get("active_nodes"),
+                            "expected_nodes": cluster.get("expected_nodes"),
+                            "quorum": cluster.get("quorum"),
+                            "quorum_active": cluster.get("active_nodes"),
+                            "quorum_expected": cluster.get("expected_nodes"),
+                            "quorum_needed": cluster.get("quorum_needed"),
+                            "excluded_nodes": cluster.get("excluded_nodes"),
+                            "reference_z": cluster.get("reference_z"),
+                            "reference_method": cluster.get("reference_method"),
                         },
                     )
 
@@ -567,6 +634,24 @@ async def membership_loop(ctx: NodeRuntime, app: FastAPI) -> None:
         elif health != last_health:
             ctx.log_event("CLUSTER_HEALTH_CHANGED", severity="INFO", from_health=last_health, to_health=health)
             last_health = health
+
+        if has_min_disk_free(LOG_DIR):
+            cluster = app.state.membership.export_cluster()
+            append_jsonl(
+                CLUSTER_LOG,
+                {
+                    "ts": time.time(),
+                    "cluster_sample_seq": ctx.next_cluster_sample_seq(),
+                    "cluster_health": cluster.get("cluster_health"),
+                    "active_nodes": cluster.get("active_nodes"),
+                    "expected_nodes": cluster.get("expected_nodes"),
+                    "quorum": cluster.get("quorum"),
+                    "quorum_needed": cluster.get("quorum_needed"),
+                    "excluded_nodes": cluster.get("excluded_nodes"),
+                    "reference_z": cluster.get("reference_z"),
+                    "reference_method": cluster.get("reference_method"),
+                },
+            )
 
         await asyncio.sleep(tick_sec)
 
@@ -978,7 +1063,7 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/export/metrics.json")
     async def export_metrics_json(limit: int = 200000):
         rows = tail_jsonl(METRICS_LOG, limit=min(max(1, limit), 500000))
-        return JSONResponse(content={"metrics": rows, "note": "ts is debug-only; primary correlation uses node_id+sequence_id"})
+        return JSONResponse(content={"metrics": rows, "note": "ts is debug-only; primary correlation uses node_id+sample_seq"})
 
     @app.get("/api/v1/export/metrics.csv")
     async def export_metrics_csv(limit: int = 200000):
@@ -989,16 +1074,18 @@ def create_app() -> FastAPI:
             m = r.get("metrics") or {}
             if isinstance(m, dict):
                 for k in m.keys():
+                    if str(k) == "sequence":
+                        continue
                     keys.add(str(k))
         metric_cols = sorted(keys)
 
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["node_id", "sequence_id", "debug_ts"] + metric_cols)
+        w.writerow(["node_id", "sample_seq", "debug_ts"] + metric_cols)
 
         for r in rows:
             node_id_ = r.get("node_id")
-            seq_ = r.get("sequence_id")
+            seq_ = r.get("sample_seq") or r.get("sequence_id")
             ts_ = r.get("ts")
             m = r.get("metrics") or {}
             row = [node_id_, seq_, ts_]
@@ -1012,6 +1099,164 @@ def create_app() -> FastAPI:
             io.BytesIO(data),
             media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="{_download_name("metrics", "csv")}"'},
+        )
+
+    def _parse_seq(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _row_seq_metric(row: Dict[str, Any]) -> Optional[int]:
+        return (
+            _parse_seq(row.get("sample_seq"))
+            or _parse_seq(row.get("sequence_id"))
+            or _parse_seq((row.get("metrics") or {}).get("sequence"))
+        )
+
+    def _row_seq_cluster(row: Dict[str, Any]) -> Optional[int]:
+        return _parse_seq(row.get("cluster_sample_seq"))
+
+    @app.get("/api/v1/export/metrics-history.csv")
+    async def export_metrics_history_csv(
+        scope: str = "all",
+        last_n: int = 10000,
+        since_sample_seq: Optional[int] = None,
+        node_id: Optional[str] = None,
+    ):
+        max_n = 50000
+        last_n = min(max(1, int(last_n)), max_n)
+        scope = (scope or "all").lower()
+
+        if scope not in ("all", "node", "cluster"):
+            raise HTTPException(status_code=400, detail="invalid scope")
+
+        if scope == "cluster":
+            rows = [] if not CLUSTER_LOG.exists() else [
+                json.loads(l) for l in CLUSTER_LOG.read_text(encoding="utf-8").splitlines() if l.strip()
+            ]
+            if since_sample_seq is not None:
+                rows = [r for r in rows if (_row_seq_cluster(r) is not None and _row_seq_cluster(r) >= int(since_sample_seq))]
+            rows = rows[-last_n:]
+
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow([
+                "cluster_sample_seq",
+                "debug_ts",
+                "cluster_health",
+                "active_nodes",
+                "expected_nodes",
+                "quorum",
+                "quorum_needed",
+                "excluded_nodes",
+                "reference_z",
+                "reference_method",
+            ])
+
+            for r in rows:
+                w.writerow([
+                    r.get("cluster_sample_seq"),
+                    r.get("ts"),
+                    r.get("cluster_health"),
+                    r.get("active_nodes"),
+                    r.get("expected_nodes"),
+                    r.get("quorum"),
+                    r.get("quorum_needed"),
+                    json.dumps(r.get("excluded_nodes") or []),
+                    r.get("reference_z"),
+                    r.get("reference_method"),
+                ])
+
+            data = buf.getvalue().encode("utf-8")
+            return StreamingResponse(
+                io.BytesIO(data),
+                media_type="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="{_download_name("cluster_history", "csv")}"'},
+            )
+
+        rows = [] if not METRICS_LOG.exists() else [
+            json.loads(l) for l in METRICS_LOG.read_text(encoding="utf-8").splitlines() if l.strip()
+        ]
+        if scope == "node":
+            if not node_id:
+                raise HTTPException(status_code=400, detail="node_id required for scope=node")
+            rows = [r for r in rows if r.get("node_id") == node_id]
+
+        if since_sample_seq is not None:
+            rows = [r for r in rows if (_row_seq_metric(r) is not None and _row_seq_metric(r) >= int(since_sample_seq))]
+
+        rows = rows[-last_n:]
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([
+            "node_id",
+            "sample_seq",
+            "debug_ts",
+            "sync_status",
+            "member_state",
+            "sync_flag",
+            "peer_addr",
+            "z",
+            "drift",
+            "stability",
+            "ppm_offset",
+            "rate_hz",
+            "peer_rate_hz",
+            "cluster_health",
+            "active_nodes",
+            "expected_nodes",
+            "quorum",
+            "quorum_active",
+            "quorum_expected",
+            "quorum_needed",
+            "excluded_nodes",
+            "reference_z",
+            "reference_method",
+        ])
+
+        for r in rows:
+            m = r.get("metrics") or {}
+            sync_running = r.get("sync_running")
+            state = r.get("state")
+            sync_state = r.get("sync_state") or _sync_state_from(state, sync_running)
+            active_nodes = r.get("active_nodes")
+            expected_nodes = r.get("expected_nodes")
+            quorum = r.get("quorum")
+            if quorum is None and active_nodes is not None and expected_nodes is not None:
+                quorum = f"{active_nodes}/{expected_nodes}"
+            w.writerow([
+                r.get("node_id"),
+                _row_seq_metric(r),
+                r.get("ts"),
+                sync_state,
+                state,
+                sync_running,
+                r.get("peer_addr"),
+                m.get("z"),
+                m.get("drift"),
+                m.get("stability"),
+                m.get("ppm_offset"),
+                m.get("rate_hz"),
+                m.get("peer_rate_hz"),
+                r.get("cluster_health"),
+                active_nodes,
+                expected_nodes,
+                quorum,
+                r.get("quorum_active") or active_nodes,
+                r.get("quorum_expected") or expected_nodes,
+                r.get("quorum_needed"),
+                json.dumps(r.get("excluded_nodes") or []),
+                r.get("reference_z"),
+                r.get("reference_method"),
+            ])
+
+        data = buf.getvalue().encode("utf-8")
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{_download_name("metrics_history", "csv")}"'},
         )
 
     return app

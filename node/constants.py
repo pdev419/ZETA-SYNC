@@ -14,5 +14,6 @@ NODE_ID_FILE = STATE_DIR / "node_id"
 EVENTS_LOG = LOG_DIR / "events.jsonl"
 METRICS_LOG = LOG_DIR / "metrics.jsonl"
 SECURITY_LOG = LOG_DIR / "security.jsonl"
+CLUSTER_LOG = LOG_DIR / "cluster.jsonl"
 
 ENV_FILE = PROJECT_ROOT / ".env"

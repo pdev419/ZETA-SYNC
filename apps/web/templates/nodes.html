@@ -27,7 +27,17 @@
             <div class="muted" id="clusterLine">…</div>
             <div class="small muted" id="clusterRule"></div>
           </div>
-          <div class="row">
+          <div class="row" style="flex-wrap: wrap; gap: 8px; justify-content: flex-end;">
+            <div class="row" style="gap: 6px; align-items: center; background: #0f141a; border: 1px solid rgba(255,255,255,0.08); padding: 8px 10px; border-radius: 10px;">
+              <span class="small muted" style="margin-right: 4px;">History export</span>
+              <select id="historyScope" class="input" style="min-width: 150px;">
+                <option value="node">This node</option>
+                <option value="all">All nodes</option>
+                <option value="cluster">Cluster summary</option>
+              </select>
+              <input id="historyRows" class="input" type="number" min="1" max="50000" value="10000" style="width: 110px;" placeholder="Last N" />
+              <button class="btn" onclick="downloadHistory()">Download CSV</button>
+            </div>
             <button class="btn" onclick="loadNodes()">Refresh</button>
           </div>
         </div>
@@ -53,6 +63,15 @@
         if(m < 60) return m + "m ago";
         const h = Math.floor(m/60);
         return h + "h ago";
+      }
+
+      let localNodeId = null;
+
+      async function loadLocalNodeId(){
+        if(localNodeId) return localNodeId;
+        const st = await fetch("/api/v1/cluster/status").then(r=>r.json());
+        localNodeId = st.node_id || null;
+        return localNodeId;
       }
 
       function syncPill(n){
@@ -114,6 +133,22 @@
         const nodes = res.nodes || [];
         document.getElementById("nodesGrid").innerHTML = nodes.map(nodeCard).join("");
         document.getElementById("rawNodes").textContent = JSON.stringify(res, null, 2);
+      }
+
+      async function downloadHistory(){
+        const scope = document.getElementById("historyScope").value;
+        const input = document.getElementById("historyRows");
+        let n = parseInt(input.value || "", 10);
+        if(!n || n < 1) n = 10000;
+        if(n > 50000) n = 50000;
+        input.value = String(n);
+
+        let url = `/api/v1/export/metrics-history.csv?scope=${encodeURIComponent(scope)}&last_n=${n}`;
+        if(scope === "node"){
+          const id = await loadLocalNodeId();
+          if(id) url += `&node_id=${encodeURIComponent(id)}`;
+        }
+        window.location = url;
       }
 
       loadNodes();
